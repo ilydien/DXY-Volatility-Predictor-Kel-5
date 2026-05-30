@@ -1,0 +1,95 @@
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.7.0
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+
+  kafka:
+    image: confluentinc/cp-kafka:7.7.0
+    depends_on:
+      - zookeeper
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: gold
+      POSTGRES_PASSWORD: gold
+      POSTGRES_DB: golddb
+    volumes:
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql
+
+  dragonfly:
+    image: docker.dragonflydb.io/dragonfly/dragonfly:v1.26.3
+
+  ingestor:
+    build: .
+    command: python /app/ingestors/ingestor.py
+    depends_on:
+      - kafka
+      - dragonfly
+      - postgres
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      DRAGONFLY_HOST: dragonfly
+      POSTGRES_DSN: postgresql://gold:gold@postgres:5432/golddb
+      FETCH_INTERVAL: "60"
+      TICKERS: "XAUUSD=X,DX-Y.NYB,^VIX,^GSPC,CL=F"
+    restart: unless-stopped
+
+  ws_listener:
+    build: .
+    command: python /app/ingestors/ws_listener.py
+    depends_on:
+      - kafka
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      WS_TICKERS: "XAUUSD=X"
+    restart: unless-stopped
+
+  predictor:
+    build: .
+    command: python /app/ml_pipeline/predictor.py
+    depends_on:
+      - kafka
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    volumes:
+      - model_storage:/app/models
+    restart: unless-stopped
+
+  sink:
+    build: .
+    command: python /app/ml_pipeline/sink.py
+    depends_on:
+      - kafka
+      - dragonfly
+      - postgres
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      DRAGONFLY_HOST: dragonfly
+      POSTGRES_DSN: postgresql://gold:gold@postgres:5432/golddb
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.5.0
+    environment:
+      GF_INSTALL_PLUGINS: redis-datasource
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning
+    depends_on:
+      - postgres
+      - dragonfly
+
+volumes:
+  model_storage:
