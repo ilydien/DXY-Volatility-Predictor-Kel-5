@@ -26,7 +26,6 @@ def fetch_and_publish():
         interval="1d",
         group_by="ticker",
         progress=False,
-        auto_adjust=True,
     )
 
     timestamp = datetime.now(timezone.utc)

@@ -46,7 +46,7 @@ def extract_ticker(df, ticker):
 
 print("[training] Fetching daily data...")
 df = yf.download(
-    TICKERS, period="5d", interval="1d", group_by="ticker", progress=False, auto_adjust=True
+    TICKERS, period="5d", interval="1d", group_by="ticker", progress=False
 )
 
 ticker_data = {}

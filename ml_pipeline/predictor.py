@@ -1,5 +1,6 @@
 import json
 import os
+import time
 import joblib
 import numpy as np
 import pandas as pd
@@ -10,19 +11,41 @@ KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
 DRAGONFLY_HOST = os.getenv("DRAGONFLY_HOST", "dragonfly")
 MODEL_PATH = os.getenv("MODEL_PATH", "/app/models/dxy_model.pkl")
 
-producer = KafkaProducer(
-    bootstrap_servers=KAFKA_BOOTSTRAP,
-    value_serializer=lambda v: json.dumps(v, default=str).encode(),
-    acks=1,
-)
 
-consumer = KafkaConsumer(
-    "market-data",
-    bootstrap_servers=KAFKA_BOOTSTRAP,
-    value_deserializer=lambda v: json.loads(v.decode()),
-    group_id="predictor-stream-group",
-    auto_offset_reset="latest",
-)
+def get_kafka_producer():
+    while True:
+        try:
+            producer = KafkaProducer(
+                bootstrap_servers=KAFKA_BOOTSTRAP,
+                value_serializer=lambda v: json.dumps(v, default=str).encode(),
+                acks=1,
+            )
+            print(f"[predictor] Connected to Kafka producer")
+            return producer
+        except Exception as e:
+            print(f"[predictor] Waiting for Kafka producer: {e}")
+            time.sleep(3)
+
+
+def get_kafka_consumer():
+    while True:
+        try:
+            consumer = KafkaConsumer(
+                "market-data",
+                bootstrap_servers=KAFKA_BOOTSTRAP,
+                value_deserializer=lambda v: json.loads(v.decode()),
+                group_id="predictor-stream-group",
+                auto_offset_reset="latest",
+            )
+            print(f"[predictor] Connected to Kafka consumer")
+            return consumer
+        except Exception as e:
+            print(f"[predictor] Waiting for Kafka consumer: {e}")
+            time.sleep(3)
+
+
+producer = get_kafka_producer()
+consumer = get_kafka_consumer()
 
 r = redis.Redis(host=DRAGONFLY_HOST, port=6379, decode_responses=True)
 

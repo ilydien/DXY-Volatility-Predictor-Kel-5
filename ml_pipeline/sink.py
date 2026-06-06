@@ -9,13 +9,25 @@ KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
 DRAGONFLY_HOST = os.getenv("DRAGONFLY_HOST", "dragonfly")
 POSTGRES_DSN = os.getenv("POSTGRES_DSN", "postgresql://gold:gold@postgres:5432/golddb")
 
-consumer = KafkaConsumer(
-    "dxy-predictions",
-    bootstrap_servers=KAFKA_BOOTSTRAP,
-    value_deserializer=lambda v: json.loads(v.decode()),
-    group_id="sink-group",
-    auto_offset_reset="latest",
-)
+
+def get_kafka_consumer():
+    while True:
+        try:
+            consumer = KafkaConsumer(
+                "dxy-predictions",
+                bootstrap_servers=KAFKA_BOOTSTRAP,
+                value_deserializer=lambda v: json.loads(v.decode()),
+                group_id="sink-group",
+                auto_offset_reset="latest",
+            )
+            print(f"[sink] Connected to Kafka")
+            return consumer
+        except Exception as e:
+            print(f"[sink] Waiting for Kafka: {e}")
+            time.sleep(3)
+
+
+consumer = get_kafka_consumer()
 
 r = redis.Redis(host=DRAGONFLY_HOST, port=6379, decode_responses=True)
 

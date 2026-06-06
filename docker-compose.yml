@@ -30,7 +30,7 @@ services:
 
   ws_listener:
     build: .
-    command: python /app/ingestors/ws_listener.py
+    command: python -u /app/ingestors/ws_listener.py
     depends_on:
       - kafka
     environment:
@@ -40,7 +40,7 @@ services:
 
   predictor:
     build: .
-    command: python /app/ml_pipeline/predictor.py
+    command: python -u /app/ml_pipeline/predictor.py
     depends_on:
       - kafka
       - dragonfly
@@ -54,7 +54,7 @@ services:
 
   sink:
     build: .
-    command: python /app/ml_pipeline/sink.py
+    command: python -u /app/ml_pipeline/sink.py
     depends_on:
       - kafka
       - dragonfly
