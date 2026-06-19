@@ -31,7 +31,7 @@ def get_db():
             conn = psycopg2.connect(POSTGRES_DSN)
             return conn, conn.cursor()
         except Exception as e:
-    log.warning("Waiting for PostgreSQL: %s", e)
+            log.warning("Waiting for PostgreSQL: %s", e)
             time.sleep(3)
 
 
@@ -81,7 +81,7 @@ def collect_and_store():
 
             for _, row in tdf.iterrows():
                 r.rpush(f"history:{prefix}:close", float(row["Close"]))
-            r.ltrim(f"history:{prefix}:close", -50, -1)
+            r.ltrim(f"history:{prefix}:close", -200, -1)
 
             bar_count = len(tdf)
             total_bars += bar_count

@@ -61,6 +61,7 @@ for msg in consumer:
         pred_price_1m = body.get("predicted_price_1m")
         pred_price_3m = body.get("predicted_price_3m")
         pred_price_5m = body.get("predicted_price_5m")
+        pred_price_30m = body.get("predicted_price_30m")
 
         if predicted is None:
             continue
@@ -73,12 +74,12 @@ for msg in consumer:
             r.set("latest:dxy:pred_price_1m", pred_price_1m)
             r.set("latest:dxy:pred_price_3m", pred_price_3m)
             r.set("latest:dxy:pred_price_5m", pred_price_5m)
+            r.set("latest:dxy:pred_price_30m", pred_price_30m)
             r.rpush("history:dxy:pred_price_1m", pred_price_1m)
-            r.ltrim("history:dxy:pred_price_1m", -50, -1)
-            r.rpush("history:dxy:pred_price_3m", pred_price_3m)
-            r.ltrim("history:dxy:pred_price_3m", -50, -1)
-            r.rpush("history:dxy:pred_price_5m", pred_price_5m)
-            r.ltrim("history:dxy:pred_price_5m", -50, -1)
+            r.ltrim("history:dxy:pred_price_1m", -200, -1)
+            r.ltrim("history:dxy:pred_price_3m", -200, -1)
+            r.ltrim("history:dxy:pred_price_5m", -200, -1)
+            r.ltrim("history:dxy:pred_price_30m", -200, -1)
 
         r.xadd(
             "dxy-predictions",
@@ -94,13 +95,17 @@ for msg in consumer:
 
         cur.execute(
             """
-            INSERT INTO predictions (timestamp, predicted_close, actual_close, features)
-            VALUES (%s, %s, %s, %s)
+            INSERT INTO predictions (timestamp, predicted_close, actual_close, pred_price_1m, pred_price_3m, pred_price_5m, pred_price_30m, features)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
         """,
             (
                 ts,
                 predicted,
                 actual if actual is not None else None,
+                pred_price_1m,
+                pred_price_3m,
+                pred_price_5m,
+                pred_price_30m,
                 json.dumps(body.get("features", {})),
             ),
         )

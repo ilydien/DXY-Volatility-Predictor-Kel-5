@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS predictions (
     pred_price_1m DOUBLE PRECISION,
     pred_price_3m DOUBLE PRECISION,
     pred_price_5m DOUBLE PRECISION,
+    pred_price_30m DOUBLE PRECISION,
     features JSONB
 );
 
@@ -37,6 +38,7 @@ COMMENT ON COLUMN predictions.actual_close IS 'Actual volatility (ground truth)'
 COMMENT ON COLUMN predictions.pred_price_1m IS 'Predicted DXY price 1 minute ahead';
 COMMENT ON COLUMN predictions.pred_price_3m IS 'Predicted DXY price 3 minutes ahead';
 COMMENT ON COLUMN predictions.pred_price_5m IS 'Predicted DXY price 5 minutes ahead';
+COMMENT ON COLUMN predictions.pred_price_30m IS 'Predicted DXY price 30 minutes ahead';
 COMMENT ON COLUMN predictions.features IS 'Feature vector snapshot used for the prediction (JSON)';
 
 CREATE TABLE IF NOT EXISTS intraday_bars (
@@ -54,3 +56,5 @@ COMMENT ON TABLE intraday_bars IS '1-minute OHLCV bars for all tickers. Used for
 COMMENT ON COLUMN intraday_bars.ticker IS 'Ticker symbol';
 COMMENT ON COLUMN intraday_bars.timestamp IS 'UTC open time of the 1-minute bar';
 COMMENT ON COLUMN intraday_bars.close IS 'Close price of the 1-minute bar';
+
+ALTER TABLE predictions ADD COLUMN IF NOT EXISTS pred_price_30m DOUBLE PRECISION;

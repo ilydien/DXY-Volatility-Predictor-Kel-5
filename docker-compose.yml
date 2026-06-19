@@ -57,6 +57,22 @@ services:
       COLLECT_INTERVAL: "60"
     restart: unless-stopped
 
+  batch-predictor:
+    build: .
+    command: python -u /app/ml_pipeline/batch_predictor.py
+    depends_on:
+      - kafka
+      - dragonfly
+      - postgres
+    env_file: .env
+    environment:
+      MODEL_PATH: /app/models/dxy_model.pkl
+      ROLLING_WINDOW: "20"
+      PREDICT_INTERVAL: "60"
+    volumes:
+      - model_storage:/app/models
+    restart: unless-stopped
+
   predictor:
     build: .
     command: python -u /app/ml_pipeline/predictor.py
@@ -106,7 +122,7 @@ services:
         condition: service_healthy
     env_file: .env
     environment:
-      PREFECT_ORM_DATABASE_CONNECTION_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      PREFECT_API_DATABASE_CONNECTION_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
     restart: unless-stopped
 
   prefect-worker:

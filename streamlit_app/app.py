@@ -6,8 +6,8 @@ from datetime import datetime, timezone
 
 from db import (
     get_latest_prices, get_latest_vol, get_predictions_24h,
-    get_dxy_prices, get_latest_price_preds, get_recent_features,
-    r, PREFIX_MAP,
+    get_latest_price_preds, get_actual_vs_predicted_pg,
+    get_recent_features, r, PREFIX_MAP,
 )
 from alert import check_alert, get_alert_state
 
@@ -22,7 +22,7 @@ threshold = st.sidebar.slider(
     format="%.4f",
 )
 chart_hours = st.sidebar.slider(
-    "Price Chart Hours",
+    "Price Chart (PostgreSQL hours)",
     min_value=1, max_value=48, value=8, step=1,
 )
 
@@ -42,7 +42,6 @@ while True:
     prices = get_latest_prices()
     vol = get_latest_vol()
     df_pred = get_predictions_24h()
-    df_dxy = get_dxy_prices(hours=chart_hours)
     features = get_recent_features()
     alert_state = get_alert_state(r)
 
@@ -97,35 +96,46 @@ while True:
             st.info("No prediction data — run `docker compose exec training-flow python /app/ml_pipeline/training.py`")
 
         st.subheader("DXY Price — Actual vs Predicted")
+        df_ap = get_actual_vs_predicted_pg(hours=chart_hours)
         preds = get_latest_price_preds()
-        if not df_dxy.empty:
-            actual = df_dxy.rename(columns={"timestamp": "t", "close": "price"}).copy()
-            actual["type"] = "Actual"
-            chart_data = actual
+        if not df_ap.empty:
+            chart_data = df_ap
             if preds:
-                last_ts = chart_data["t"].iloc[-1]
+                last_ts = chart_data[chart_data["type"] == "Actual"]["timestamp"].iloc[-1]
                 pred_rows = []
-                for offset_min, label, key in [(1, "Pred 1m", "pred_1m"), (3, "Pred 3m", "pred_3m"), (5, "Pred 5m", "pred_5m")]:
+                for offset, label, key in [(1, "Pred 1m", "pred_1m"), (3, "Pred 3m", "pred_3m"), (5, "Pred 5m", "pred_5m"), (30, "Pred 30m", "pred_30m")]:
                     val = preds.get(key)
                     if val:
-                        pred_rows.append({"t": last_ts + pd.Timedelta(minutes=offset_min), "price": val, "type": label})
+                        pred_rows.append({"timestamp": last_ts + pd.Timedelta(minutes=offset), "price": val, "type": label})
                 if pred_rows:
                     chart_data = pd.concat([chart_data, pd.DataFrame(pred_rows)], ignore_index=True)
             chart = alt.Chart(chart_data).mark_line(point=True).encode(
-                x=alt.X("t:T", title="Time", axis=alt.Axis(format="%H:%M", grid=False)),
+                x=alt.X("timestamp:T", title="Time", axis=alt.Axis(format="%H:%M", grid=False)),
                 y=alt.Y("price:Q", title="DXY Price", scale=alt.Scale(zero=False)),
                 color=alt.Color("type:N", scale=alt.Scale(
-                    domain=["Actual", "Pred 1m", "Pred 3m", "Pred 5m"],
-                    range=["#00cc66", "#ffcc00", "#ff8800", "#ff3300"],
+                    domain=["Actual", "Predicted", "Pred 1m", "Pred 3m", "Pred 5m", "Pred 30m"],
+                    range=["#00cc66", "#ff6600", "#ffcc00", "#ff8800", "#ff3300", "#9933ff"],
                 )),
                 strokeDash=alt.StrokeDash("type:N", scale=alt.Scale(
-                    domain=["Actual", "Pred 1m", "Pred 3m", "Pred 5m"],
-                    range=[[0], [6, 3], [6, 3], [6, 3]],
+                    domain=["Actual", "Predicted", "Pred 1m", "Pred 3m", "Pred 5m", "Pred 30m"],
+                    range=[[0], [0], [6, 3], [6, 3], [6, 3], [4, 4]],
                 )),
             ).properties(height=400)
             st.altair_chart(chart, use_container_width=True)
         else:
             st.info("No DXY price data yet — waiting for collector")
+
+        price_cols = st.columns(5)
+        actual_price = prices.get("DXY")
+        price_cols[0].metric("Actual DXY", f"{actual_price:.4f}" if actual_price else "—", border=True)
+        if preds:
+            for i, (label, key) in enumerate([("Pred 1m", "pred_1m"), ("Pred 3m", "pred_3m"), ("Pred 5m", "pred_5m"), ("Pred 30m", "pred_30m")], 1):
+                val = preds.get(key)
+                delta = (val - actual_price) if (val is not None and actual_price is not None) else None
+                price_cols[i].metric(label, f"{val:.4f}" if val else "—", delta=f"{delta:+.4f}" if delta is not None else None, border=True)
+        else:
+            for i, label in enumerate(["Pred 1m", "Pred 3m", "Pred 5m", "Pred 30m"], 1):
+                price_cols[i].metric(label, "—", border=True)
 
         with st.expander("Latest Market Snapshot"):
             st.json({k: round(v, 6) if isinstance(v, float) else v for k, v in features.items()})

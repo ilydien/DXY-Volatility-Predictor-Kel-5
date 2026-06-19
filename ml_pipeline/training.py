@@ -11,6 +11,7 @@ import time
 from datetime import datetime, timezone
 from kafka import KafkaProducer
 from sklearn.linear_model import Ridge
+from sklearn.preprocessing import StandardScaler
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 log = logging.getLogger("training")
@@ -30,6 +31,7 @@ DRAGONFLY_HOST = os.getenv("DRAGONFLY_HOST", "dragonfly")
 POSTGRES_DSN = os.getenv("POSTGRES_DSN", "postgresql://gold:gold@postgres:5432/golddb")
 MODEL_PATH = os.getenv("MODEL_PATH", "/app/models/dxy_model.pkl")
 ROLLING_WINDOW = int(os.getenv("ROLLING_WINDOW", "20"))
+VOL_SCALE = float(os.getenv("VOL_SCALE", "5.5"))
 
 
 def get_db():
@@ -126,6 +128,7 @@ def compute_features(dfs):
 
     feat_df = pd.DataFrame(index=base_idx)
 
+    vix_close_series = None
     for prefix, tdf in dfs.items():
         tdf_small = tdf[["close", "high", "low"]]
         if prefix in ["vix", "sp500"]:
@@ -139,9 +142,22 @@ def compute_features(dfs):
         returns = close.pct_change()
         feat_df[f"{prefix}_return"] = returns
         feat_df[f"{prefix}_hl_pct"] = hl / close.replace(0, np.nan)
+        if prefix == "vix":
+            vix_close_series = close
+
+    if vix_close_series is not None:
+        feat_df["vix_close"] = vix_close_series
 
     returns_mat = feat_df[[c for c in feat_df.columns if c.endswith("_return")]]
-    feat_df["dxy_roll_vol"] = returns_mat["dxy_return"].rolling(ROLLING_WINDOW).std()
+    dxy_ret = returns_mat["dxy_return"]
+    feat_df["dxy_roll_vol"] = dxy_ret.rolling(ROLLING_WINDOW).std()
+    feat_df["dxy_roll_vol_60"] = dxy_ret.rolling(60).std()
+    feat_df["dxy_roll_vol_120"] = dxy_ret.rolling(120).std()
+
+    hl_pct = ((dfs["dxy"]["high"] - dfs["dxy"]["low"]) / dfs["dxy"]["close"])
+    hl_pct = hl_pct.reindex(base_idx).fillna(0).astype(float)
+    feat_df["dxy_hl_range"] = hl_pct
+    feat_df["dxy_roll_hl_range"] = feat_df["dxy_hl_range"].rolling(ROLLING_WINDOW).mean()
 
     for col in feat_df.columns:
         feat_df[col] = feat_df[col].replace([np.inf, -np.inf], np.nan).clip(-5, 5)
@@ -162,6 +178,11 @@ def build_lag_features(feat_df):
 
     for i in range(1, 4):
         feat_df[f"dxy_roll_vol_lag{i}"] = feat_df["dxy_roll_vol"].shift(i)
+        feat_df[f"dxy_roll_vol_60_lag{i}"] = feat_df["dxy_roll_vol_60"].shift(i)
+        feat_df[f"dxy_roll_vol_120_lag{i}"] = feat_df["dxy_roll_vol_120"].shift(i)
+
+    if "vix_close" in feat_df.columns:
+        feat_df["vix_close_lag1"] = feat_df["vix_close"].shift(1)
 
     return feat_df.dropna()
 
@@ -188,15 +209,23 @@ FEATURE_COLS = (
     [f"{p}_return_lag{i}" for p in TICKER_MAP.values() for i in range(1, 4)]
     + [f"{p}_hl_pct_lag1" for p in TICKER_MAP.values()]
     + ["dxy_roll_vol_lag1", "dxy_roll_vol_lag2", "dxy_roll_vol_lag3"]
+    + ["dxy_roll_vol_60_lag1", "dxy_roll_vol_60_lag2", "dxy_roll_vol_60_lag3"]
+    + ["dxy_roll_vol_120_lag1", "dxy_roll_vol_120_lag2", "dxy_roll_vol_120_lag3"]
+    + ["vix_close_lag1"]
 )
 
 X = feat_df[FEATURE_COLS].values
-y = feat_df["dxy_roll_vol"].values
+y = feat_df["dxy_roll_hl_range"].values
 
-model = Ridge(alpha=1.0)
-model.fit(X, y)
+SCALER_PATH = MODEL_PATH.replace(".pkl", "_scaler.pkl")
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+joblib.dump(scaler, SCALER_PATH)
+
+model = Ridge(alpha=0.01)
+model.fit(X_scaled, y)
 joblib.dump(model, MODEL_PATH)
-log.info("Vol model trained on %d rows, %d features", len(feat_df), len(FEATURE_COLS))
+log.info("Vol model trained on %d rows, %d features (scaled)", len(feat_df), len(FEATURE_COLS))
 
 dxy_close_series = dfs["dxy"]["close"]
 dxy_rets = dxy_close_series.pct_change()
@@ -204,40 +233,42 @@ price_targets = pd.DataFrame(index=dxy_close_series.index)
 price_targets["return_t1"] = dxy_rets.shift(-1)
 price_targets["return_t3"] = dxy_rets.rolling(3).sum().shift(-3)
 price_targets["return_t5"] = dxy_rets.rolling(5).sum().shift(-5)
+price_targets["return_t30"] = dxy_rets.rolling(30).sum().shift(-30)
 price_targets = price_targets.dropna()
 common_idx = feat_df.index.intersection(price_targets.index)
 if len(common_idx) >= 5:
-    X_price = feat_df.loc[common_idx, FEATURE_COLS].values
+    X_price = scaler.transform(feat_df.loc[common_idx, FEATURE_COLS].values)
     y_price = price_targets.loc[common_idx].values
-    price_model = Ridge(alpha=1.0)
+    price_model = Ridge(alpha=0.01)
     price_model.fit(X_price, y_price)
     PRICE_MODEL_PATH = MODEL_PATH.replace(".pkl", "_price.pkl")
     joblib.dump(price_model, PRICE_MODEL_PATH)
-    log.info("Price model trained on %d rows, 3 targets (t+1, t+3, t+5)", len(common_idx))
+    log.info("Price model trained on %d rows, 4 targets (t+1, t+3, t+5, t+30)", len(common_idx))
 else:
     price_model = None
     log.warning("Not enough price data (%d rows), skipping price model", len(common_idx))
 
 latest = feat_df.iloc[-1:]
 
-pred_X = latest[FEATURE_COLS].values
-predicted_vol = float(model.predict(pred_X)[0])
+pred_X = scaler.transform(latest[FEATURE_COLS].values)
+predicted_vol = float(model.predict(pred_X)[0]) * VOL_SCALE
 predicted_vol = max(predicted_vol, 0)
 
-actual_vol = float(latest["dxy_roll_vol"].iloc[0])
+actual_vol = float(latest["dxy_roll_hl_range"].iloc[0]) * VOL_SCALE
 dxy_latest = dfs["dxy"].loc[latest.index[0]]
 dxy_close = float(dxy_latest["close"])
 
 features = {col: float(latest[col].iloc[0]) for col in feat_df.columns if col != "date"}
 
-pred_price_1m = pred_price_3m = pred_price_5m = None
+pred_price_1m = pred_price_3m = pred_price_5m = pred_price_30m = None
 if price_model is not None:
-    price_X = latest[FEATURE_COLS].values
+    price_X = scaler.transform(latest[FEATURE_COLS].values)
     price_raw = price_model.predict(price_X)[0]
     last_close = dxy_close
     pred_price_1m = round(last_close * (1 + price_raw[0]), 4)
     pred_price_3m = round(last_close * (1 + price_raw[1]), 4)
     pred_price_5m = round(last_close * (1 + price_raw[2]), 4)
+    pred_price_30m = round(last_close * (1 + price_raw[3]), 4) if len(price_raw) > 3 else None
 
 result = {
     "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -247,6 +278,7 @@ result = {
     "predicted_price_1m": pred_price_1m,
     "predicted_price_3m": pred_price_3m,
     "predicted_price_5m": pred_price_5m,
+    "predicted_price_30m": pred_price_30m,
     "source": "batch",
     "features": {k: round(v, 6) if isinstance(v, float) else v for k, v in features.items()},
 }
@@ -275,7 +307,7 @@ with r.pipeline() as pipe:
             continue
         for val in tdf["close"].astype(float).values:
             pipe.rpush(f"history:{prefix}:close", float(val))
-        pipe.ltrim(f"history:{prefix}:close", -50, -1)
+        pipe.ltrim(f"history:{prefix}:close", -200, -1)
     pipe.execute()
 
 log.info("Dragonfly cache updated")

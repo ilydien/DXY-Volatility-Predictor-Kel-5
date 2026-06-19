@@ -28,6 +28,9 @@ FEATURE_COLS = (
     [f"{p}_return_lag{i}" for p in ["dxy", "eur", "jpy", "gbp", "vix", "sp500"] for i in range(1, 4)]
     + [f"{p}_hl_pct_lag1" for p in ["dxy", "eur", "jpy", "gbp", "vix", "sp500"]]
     + ["dxy_roll_vol_lag1", "dxy_roll_vol_lag2", "dxy_roll_vol_lag3"]
+    + ["dxy_roll_vol_60_lag1", "dxy_roll_vol_60_lag2", "dxy_roll_vol_60_lag3"]
+    + ["dxy_roll_vol_120_lag1", "dxy_roll_vol_120_lag2", "dxy_roll_vol_120_lag3"]
+    + ["vix_close_lag1"]
 )
 
 ALL_PREFIXES = ["dxy", "eur", "jpy", "gbp", "vix", "sp500"]
@@ -81,8 +84,16 @@ if os.path.exists(PRICE_MODEL_PATH):
 else:
     log.warning("No price model found")
 
+SCALER_PATH = MODEL_PATH.replace(".pkl", "_scaler.pkl")
+scaler = None
+if os.path.exists(SCALER_PATH):
+    scaler = joblib.load(SCALER_PATH)
+    log.info("Loaded scaler from %s", SCALER_PATH)
+else:
+    log.warning("No scaler found")
 
-def get_history(prefix, n=50):
+
+def get_history(prefix, n=200):
     raw = r.lrange(f"history:{prefix}:close", -n, -1)
     try:
         return [float(v) for v in raw]
@@ -141,6 +152,19 @@ def build_features(dxy_tick=None):
         else:
             features[f"dxy_roll_vol_lag{i}"] = 0.0
 
+    for w, label in [(60, 60), (120, 120)]:
+        for i in range(1, 4):
+            if len(dxy_rets) >= w + i:
+                sub = dxy_rets[-(w + i):-i]
+                features[f"dxy_roll_vol_{label}_lag{i}"] = float(np.std(sub, ddof=0))
+            elif len(dxy_rets) >= w:
+                features[f"dxy_roll_vol_{label}_lag{i}"] = float(np.std(dxy_rets[-w:], ddof=0))
+            else:
+                features[f"dxy_roll_vol_{label}_lag{i}"] = 0.0
+
+    vix_close = r.get("latest:vix:close")
+    features["vix_close_lag1"] = float(vix_close) if vix_close else 0.0
+
     return features
 
 
@@ -158,8 +182,12 @@ def compute_instant_vol():
     return float(np.std(rets[-window:], ddof=0))
 
 
+FORCE_PUBLISH_INTERVAL = int(os.getenv("FORCE_PUBLISH_INTERVAL", "60"))
+VOL_SCALE = float(os.getenv("VOL_SCALE", "5.5"))
+
 log.info("Waiting for streaming market data...")
 last_predicted = None
+last_publish_time = 0
 
 for msg in consumer:
     try:
@@ -202,37 +230,44 @@ for msg in consumer:
 
             if model is not None:
                 X = np.array([[features.get(c, 0) for c in FEATURE_COLS]])
-                predicted_vol = max(float(model.predict(X)[0]), 0)
+                if scaler is not None:
+                    X = scaler.transform(X)
+                predicted_vol = max(float(model.predict(X)[0]), 0) * VOL_SCALE
             else:
                 predicted_vol = inst_vol
 
-            pred_price_1m = pred_price_3m = pred_price_5m = None
+            pred_price_1m = pred_price_3m = pred_price_5m = pred_price_30m = None
             if price_model is not None:
                 X_price = np.array([[features.get(c, 0) for c in FEATURE_COLS]])
+                if scaler is not None:
+                    X_price = scaler.transform(X_price)
                 price_raw = price_model.predict(X_price)[0]
                 pred_price_1m = round(close * (1 + price_raw[0]), 4)
                 pred_price_3m = round(close * (1 + price_raw[1]), 4)
                 pred_price_5m = round(close * (1 + price_raw[2]), 4)
+                pred_price_30m = round(close * (1 + price_raw[3]), 4) if len(price_raw) > 3 else None
 
             same = last_predicted is not None and abs(predicted_vol - last_predicted) / max(last_predicted, 1e-10) < 0.001
-            if same:
+            if same and time.time() - last_publish_time < FORCE_PUBLISH_INTERVAL:
                 continue
 
             result = {
                 "timestamp": ts_raw or datetime.now(timezone.utc).isoformat(),
                 "dxy_close": round(close, 4),
                 "predicted_volatility": round(predicted_vol, 6),
-                "actual_volatility": None,
+                "actual_volatility": round(inst_vol, 6),
                 "instant_volatility": round(inst_vol, 6),
                 "predicted_price_1m": pred_price_1m,
                 "predicted_price_3m": pred_price_3m,
                 "predicted_price_5m": pred_price_5m,
+                "predicted_price_30m": pred_price_30m,
                 "source": "stream",
                 "features": {k: round(v, 6) if isinstance(v, float) else v for k, v in features.items()},
             }
 
             producer.send("dxy-predictions", value=result)
             last_predicted = predicted_vol
+            last_publish_time = time.time()
             log.info("pred_vol=%.6f inst_vol=%.6f", predicted_vol, inst_vol)
 
     except Exception as e:
