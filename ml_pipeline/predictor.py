@@ -2,128 +2,238 @@ import json
 import os
 import time
 import joblib
+import logging
 import numpy as np
-import pandas as pd
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+log = logging.getLogger("predictor")
+from datetime import datetime, timezone
 from kafka import KafkaConsumer, KafkaProducer
 import redis
 
 KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
 DRAGONFLY_HOST = os.getenv("DRAGONFLY_HOST", "dragonfly")
 MODEL_PATH = os.getenv("MODEL_PATH", "/app/models/dxy_model.pkl")
+ROLLING_WINDOW = int(os.getenv("ROLLING_WINDOW", "20"))
+MAX_AGE_SECONDS = int(os.getenv("MAX_DATA_AGE", "120"))
+
+TICKER_MAP = {
+    "DX-Y.NYB": "dxy",
+    "EURUSD=X": "eur",
+    "USDJPY=X": "jpy",
+    "GBPUSD=X": "gbp",
+}
+
+FEATURE_COLS = (
+    [f"{p}_return_lag{i}" for p in ["dxy", "eur", "jpy", "gbp", "vix", "sp500"] for i in range(1, 4)]
+    + [f"{p}_hl_pct_lag1" for p in ["dxy", "eur", "jpy", "gbp", "vix", "sp500"]]
+    + ["dxy_roll_vol_lag1", "dxy_roll_vol_lag2", "dxy_roll_vol_lag3"]
+)
+
+ALL_PREFIXES = ["dxy", "eur", "jpy", "gbp", "vix", "sp500"]
+WS_PREFIXES = ["dxy", "eur", "jpy", "gbp"]
 
 
 def get_kafka_producer():
     while True:
         try:
-            producer = KafkaProducer(
+            return KafkaProducer(
                 bootstrap_servers=KAFKA_BOOTSTRAP,
                 value_serializer=lambda v: json.dumps(v, default=str).encode(),
                 acks=1,
             )
-            print(f"[predictor] Connected to Kafka producer")
-            return producer
         except Exception as e:
-            print(f"[predictor] Waiting for Kafka producer: {e}")
+            log.warning("Waiting for Kafka producer: %s", e)
             time.sleep(3)
 
 
 def get_kafka_consumer():
     while True:
         try:
-            consumer = KafkaConsumer(
+            return KafkaConsumer(
                 "market-data",
                 bootstrap_servers=KAFKA_BOOTSTRAP,
                 value_deserializer=lambda v: json.loads(v.decode()),
                 group_id="predictor-stream-group",
                 auto_offset_reset="latest",
             )
-            print(f"[predictor] Connected to Kafka consumer")
-            return consumer
         except Exception as e:
-            print(f"[predictor] Waiting for Kafka consumer: {e}")
+            log.warning("Waiting for Kafka consumer: %s", e)
             time.sleep(3)
 
 
 producer = get_kafka_producer()
 consumer = get_kafka_consumer()
-
 r = redis.Redis(host=DRAGONFLY_HOST, port=6379, decode_responses=True)
 
 model = None
 if os.path.exists(MODEL_PATH):
     model = joblib.load(MODEL_PATH)
-    print(f"[predictor] Loaded model from {MODEL_PATH}")
+    log.info("Loaded model from %s", MODEL_PATH)
 else:
-    print("[predictor] No model found, using heuristic")
+    log.warning("No model found, using heuristic")
 
-CACHE_KEYS = [
-    "latest:eur:close", "latest:jpy:close", "latest:gbp:close",
-    "latest:vix:close", "latest:sp500:close", "latest:dxy:close",
-    "latest:dxy:high", "latest:dxy:low", "latest:dxy:volatility",
-]
-
-
-def read_cache():
-    vals = r.mget(CACHE_KEYS)
-    out = {}
-    for key, val in zip(CACHE_KEYS, vals):
-        name = key.replace("latest:", "").replace(":", "_")
-        out[name] = float(val) if val else None
-    return out
+PRICE_MODEL_PATH = MODEL_PATH.replace(".pkl", "_price.pkl")
+price_model = None
+if os.path.exists(PRICE_MODEL_PATH):
+    price_model = joblib.load(PRICE_MODEL_PATH)
+    log.info("Loaded price model from %s", PRICE_MODEL_PATH)
+else:
+    log.warning("No price model found")
 
 
-FEATURE_COLS = (
-    [f"{c}_lag{i}" for c in ["eur_close", "jpy_close", "gbp_close", "vix_close", "sp500_close", "dxy_close"] for i in range(1, 4)]
-    + ["dxy_volatility_lag1"]
-)
+def get_history(prefix, n=50):
+    raw = r.lrange(f"history:{prefix}:close", -n, -1)
+    try:
+        return [float(v) for v in raw]
+    except (TypeError, ValueError):
+        return []
 
 
-def build_features(dxy_close, cache):
+def compute_returns(prices):
+    if len(prices) < 2:
+        return []
+    return [(prices[i] / prices[i - 1]) - 1 for i in range(1, len(prices))]
+
+
+def build_features(dxy_tick=None):
+    prices = {}
+    for prefix in ALL_PREFIXES:
+        prices[prefix] = get_history(prefix)
+
+    min_len = min(len(v) for v in prices.values())
+    if min_len < 4:
+        return None
+
     features = {}
-    for prefix in ["eur", "jpy", "gbp", "vix", "sp500"]:
-        features[f"{prefix}_close"] = cache.get(f"{prefix}_close", 0)
-    features["dxy_close"] = dxy_close
-    for col in ["eur_close", "jpy_close", "gbp_close", "vix_close", "sp500_close", "dxy_close"]:
+    for prefix in ALL_PREFIXES:
+        rets = compute_returns(prices[prefix])
         for i in range(1, 4):
-            features[f"{col}_lag{i}"] = features.get(col, 0)
-    features["dxy_volatility_lag1"] = cache.get("dxy_volatility", 0)
+            idx = -(i + 1)
+            features[f"{prefix}_return_lag{i}"] = float(rets[idx]) if abs(idx) <= len(rets) else 0.0
+
+        high = r.get(f"latest:{prefix}:high")
+        low = r.get(f"latest:{prefix}:low")
+        close_ = prices[prefix][-1]
+        if high and low and close_:
+            features[f"{prefix}_hl_pct_lag1"] = (float(high) - float(low)) / float(close_)
+        else:
+            features[f"{prefix}_hl_pct_lag1"] = 0.0
+
+    if dxy_tick is not None and prices["dxy"]:
+        features["dxy_return_lag1"] = (dxy_tick / prices["dxy"][-1]) - 1
+
+    for prefix in ["eur", "jpy", "gbp"]:
+        tick = r.get(f"latest:{prefix}:close")
+        if tick and prices[prefix]:
+            tick_f = float(tick)
+            last_close = prices[prefix][-1]
+            if last_close and abs(tick_f - last_close) / max(last_close, 0.0001) > 1e-8:
+                features[f"{prefix}_return_lag1"] = (tick_f / last_close) - 1
+
+    dxy_rets = compute_returns(prices["dxy"])
+    for i in range(1, 4):
+        if len(dxy_rets) >= ROLLING_WINDOW + i:
+            sub = dxy_rets[-(ROLLING_WINDOW + i):-i]
+            features[f"dxy_roll_vol_lag{i}"] = float(np.std(sub, ddof=0))
+        elif len(dxy_rets) >= ROLLING_WINDOW:
+            features[f"dxy_roll_vol_lag{i}"] = float(np.std(dxy_rets[-ROLLING_WINDOW:], ddof=0))
+        else:
+            features[f"dxy_roll_vol_lag{i}"] = 0.0
+
     return features
 
 
-print("[predictor] Waiting for streaming market data...")
+def compute_instant_vol():
+    prices = get_history("dxy")
+    tick = r.get("latest:dxy:close")
+    if tick and prices:
+        tick_f = float(tick)
+        if abs(prices[-1] - tick_f) / max(prices[-1], 0.0001) > 1e-6:
+            prices = prices + [tick_f]
+    if len(prices) < 2:
+        return 0.0
+    rets = [(prices[i] / prices[i - 1]) - 1 for i in range(1, len(prices))]
+    window = min(ROLLING_WINDOW, len(rets))
+    return float(np.std(rets[-window:], ddof=0))
+
+
+log.info("Waiting for streaming market data...")
+last_predicted = None
+
 for msg in consumer:
     try:
         body = msg.value
         data = body.get("data", {})
+        ts_raw = body.get("timestamp")
 
-        dxy_data = data.get("DX-Y.NYB", {})
-        if not dxy_data:
-            continue
+        if ts_raw:
+            try:
+                age = (datetime.now(timezone.utc) - datetime.fromisoformat(ts_raw)).total_seconds()
+                if age > MAX_AGE_SECONDS:
+                    continue
+            except (ValueError, TypeError):
+                pass
 
-        dxy_close = float(dxy_data.get("close", 0))
-        cache = read_cache()
+        for ticker, ticker_data in data.items():
+            prefix = TICKER_MAP.get(ticker)
+            if not prefix:
+                continue
 
-        features = build_features(dxy_close, cache)
+            close = float(ticker_data.get("close", 0))
+            r.set(f"latest:{prefix}:close", close)
+            high = ticker_data.get("high")
+            low = ticker_data.get("low")
+            if high:
+                r.set(f"latest:{prefix}:high", float(high))
+            if low:
+                r.set(f"latest:{prefix}:low", float(low))
 
-        if model is not None:
-            df_feat = pd.DataFrame([{k: features.get(k, 0) for k in FEATURE_COLS}])
-            predicted_vol = float(model.predict(df_feat)[0])
-        else:
-            predicted_vol = cache.get("dxy_volatility", 0)
+            if ticker != "DX-Y.NYB":
+                log.debug("Updated %s=%.4f", prefix, close)
+                continue
 
-        predicted_vol = max(predicted_vol, 0)
+            inst_vol = compute_instant_vol()
+            r.set("latest:dxy:instant_volatility", inst_vol)
 
-        result = {
-            "timestamp": body.get("timestamp"),
-            "dxy_close": round(dxy_close, 4),
-            "predicted_volatility": round(predicted_vol, 4),
-            "actual_volatility": None,
-            "source": "stream",
-            "features": {k: round(v, 4) if isinstance(v, float) else v for k, v in features.items()},
-        }
+            features = build_features(dxy_tick=close)
+            if features is None:
+                continue
 
-        producer.send("dxy-predictions", value=result)
-        print(f"[predictor] DXY={dxy_close:.4f} pred_vol={predicted_vol:.4f}")
+            if model is not None:
+                X = np.array([[features.get(c, 0) for c in FEATURE_COLS]])
+                predicted_vol = max(float(model.predict(X)[0]), 0)
+            else:
+                predicted_vol = inst_vol
+
+            pred_price_1m = pred_price_3m = pred_price_5m = None
+            if price_model is not None:
+                X_price = np.array([[features.get(c, 0) for c in FEATURE_COLS]])
+                price_raw = price_model.predict(X_price)[0]
+                pred_price_1m = round(close * (1 + price_raw[0]), 4)
+                pred_price_3m = round(close * (1 + price_raw[1]), 4)
+                pred_price_5m = round(close * (1 + price_raw[2]), 4)
+
+            same = last_predicted is not None and abs(predicted_vol - last_predicted) / max(last_predicted, 1e-10) < 0.001
+            if same:
+                continue
+
+            result = {
+                "timestamp": ts_raw or datetime.now(timezone.utc).isoformat(),
+                "dxy_close": round(close, 4),
+                "predicted_volatility": round(predicted_vol, 6),
+                "actual_volatility": None,
+                "instant_volatility": round(inst_vol, 6),
+                "predicted_price_1m": pred_price_1m,
+                "predicted_price_3m": pred_price_3m,
+                "predicted_price_5m": pred_price_5m,
+                "source": "stream",
+                "features": {k: round(v, 6) if isinstance(v, float) else v for k, v in features.items()},
+            }
+
+            producer.send("dxy-predictions", value=result)
+            last_predicted = predicted_vol
+            log.info("pred_vol=%.6f inst_vol=%.6f", predicted_vol, inst_vol)
 
     except Exception as e:
-        print(f"[predictor] Error: {e}")
+        log.error("Error: %s", e)

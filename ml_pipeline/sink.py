@@ -1,9 +1,13 @@
 import json
+import logging
 import os
 import time
 from kafka import KafkaConsumer
 import redis
 import psycopg2
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+log = logging.getLogger("sink")
 
 KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
 DRAGONFLY_HOST = os.getenv("DRAGONFLY_HOST", "dragonfly")
@@ -20,10 +24,10 @@ def get_kafka_consumer():
                 group_id="sink-group",
                 auto_offset_reset="latest",
             )
-            print(f"[sink] Connected to Kafka")
+            log.info("Connected to Kafka")
             return consumer
         except Exception as e:
-            print(f"[sink] Waiting for Kafka: {e}")
+            log.warning("Waiting for Kafka: %s", e)
             time.sleep(3)
 
 
@@ -38,13 +42,13 @@ def get_db():
             conn = psycopg2.connect(POSTGRES_DSN)
             return conn, conn.cursor()
         except Exception as e:
-            print(f"[sink] Waiting for PostgreSQL: {e}")
+            log.warning("Waiting for PostgreSQL: %s", e)
             time.sleep(3)
 
 
 conn, cur = get_db()
 
-print("[sink] Waiting for predictions on 'dxy-predictions'...")
+log.info("Waiting for predictions on 'dxy-predictions'...")
 for msg in consumer:
     try:
         body = msg.value
@@ -54,6 +58,9 @@ for msg in consumer:
         ts = body.get("timestamp")
         dxy_close = body.get("dxy_close")
         source = body.get("source", "unknown")
+        pred_price_1m = body.get("predicted_price_1m")
+        pred_price_3m = body.get("predicted_price_3m")
+        pred_price_5m = body.get("predicted_price_5m")
 
         if predicted is None:
             continue
@@ -61,6 +68,17 @@ for msg in consumer:
         r.set("latest:dxy:predicted_volatility", predicted)
         r.set("latest:dxy:predicted_timestamp", ts)
         r.set("latest:dxy:close", dxy_close)
+
+        if pred_price_1m is not None:
+            r.set("latest:dxy:pred_price_1m", pred_price_1m)
+            r.set("latest:dxy:pred_price_3m", pred_price_3m)
+            r.set("latest:dxy:pred_price_5m", pred_price_5m)
+            r.rpush("history:dxy:pred_price_1m", pred_price_1m)
+            r.ltrim("history:dxy:pred_price_1m", -50, -1)
+            r.rpush("history:dxy:pred_price_3m", pred_price_3m)
+            r.ltrim("history:dxy:pred_price_3m", -50, -1)
+            r.rpush("history:dxy:pred_price_5m", pred_price_5m)
+            r.ltrim("history:dxy:pred_price_5m", -50, -1)
 
         r.xadd(
             "dxy-predictions",
@@ -88,7 +106,7 @@ for msg in consumer:
         )
         conn.commit()
 
-        print(f"[sink] source={source} pred_vol={predicted:.4f} actual_vol={actual}")
+        log.info("source=%s pred_vol=%.4f actual_vol=%s", source, predicted, actual)
 
     except Exception as e:
         print(f"[sink] Error: {e}")

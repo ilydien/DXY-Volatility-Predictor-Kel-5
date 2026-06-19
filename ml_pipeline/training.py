@@ -5,16 +5,17 @@ import json
 import joblib
 import os
 import redis
+import psycopg2
+import logging
+import time
 from datetime import datetime, timezone
 from kafka import KafkaProducer
 from sklearn.linear_model import Ridge
 
-TICKERS = ["DX-Y.NYB", "EURUSD=X", "USDJPY=X", "GBPUSD=X", "^VIX", "^GSPC"]
-KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
-DRAGONFLY_HOST = os.getenv("DRAGONFLY_HOST", "dragonfly")
-MODEL_PATH = os.getenv("MODEL_PATH", "/app/models/dxy_model.pkl")
-DATA_PATH = os.getenv("DATA_PATH", "/app/models/training_data.pkl")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+log = logging.getLogger("training")
 
+TICKERS = ["DX-Y.NYB", "EURUSD=X", "USDJPY=X", "GBPUSD=X", "^VIX", "^GSPC"]
 TICKER_MAP = {
     "DX-Y.NYB": "dxy",
     "EURUSD=X": "eur",
@@ -24,166 +25,257 @@ TICKER_MAP = {
     "^GSPC": "sp500",
 }
 
+KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
+DRAGONFLY_HOST = os.getenv("DRAGONFLY_HOST", "dragonfly")
+POSTGRES_DSN = os.getenv("POSTGRES_DSN", "postgresql://gold:gold@postgres:5432/golddb")
+MODEL_PATH = os.getenv("MODEL_PATH", "/app/models/dxy_model.pkl")
+ROLLING_WINDOW = int(os.getenv("ROLLING_WINDOW", "20"))
+
+
+def get_db():
+    while True:
+        try:
+            conn = psycopg2.connect(POSTGRES_DSN)
+            return conn, conn.cursor()
+        except Exception as e:
+            log.warning("Waiting for PostgreSQL: %s", e)
+            time.sleep(3)
+
+
 producer = KafkaProducer(
     bootstrap_servers=KAFKA_BOOTSTRAP,
     value_serializer=lambda v: json.dumps(v, default=str).encode(),
     acks=1,
 )
-
 r = redis.Redis(host=DRAGONFLY_HOST, port=6379, decode_responses=True)
+conn, cur = get_db()
 
 
-def extract_ticker(df, ticker):
-    try:
-        if isinstance(df.columns, pd.MultiIndex):
-            tdf = df[ticker].dropna()
-        else:
-            tdf = df.dropna()
-        return tdf if not tdf.empty else None
-    except (KeyError, IndexError):
+def fetch_and_store_bars():
+    log.info("Fetching latest 1m bars from yfinance...")
+    df = yf.download(
+        TICKERS, period="1d", interval="1m", group_by="ticker", progress=False
+    )
+    count = 0
+    for ticker in TICKERS:
+        try:
+            if isinstance(df.columns, pd.MultiIndex):
+                tdf = df[ticker].dropna()
+            else:
+                tdf = df.dropna()
+            if tdf.empty:
+                continue
+            for idx, row in tdf.iterrows():
+                ts = idx.to_pydatetime()
+                cur.execute(
+                    """
+                    INSERT INTO intraday_bars (ticker, timestamp, open, high, low, close, volume)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (ticker, timestamp) DO NOTHING
+                    """,
+                    (
+                        ticker, ts,
+                        float(row["Open"]), float(row["High"]),
+                        float(row["Low"]), float(row["Close"]),
+                        int(row["Volume"]) if not pd.isna(row["Volume"]) else 0,
+                    ),
+                )
+                count += 1
+            conn.commit()
+        except Exception as e:
+            log.error("Fetch error %s: %s", ticker, e)
+    log.info("Stored %d new bars", count)
+
+
+def load_training_data():
+    query = """
+    SELECT ticker, timestamp, open, high, low, close
+    FROM intraday_bars
+    WHERE timestamp >= NOW() - INTERVAL '30 days'
+    ORDER BY ticker, timestamp
+    """
+    cur.execute(query)
+    rows = cur.fetchall()
+
+    if len(rows) < 50:
+        log.warning("Insufficient data (%d rows), aborting", len(rows))
         return None
 
+    df = pd.DataFrame(rows, columns=["ticker", "timestamp", "open", "high", "low", "close"])
+    dfs = {}
+    for ticker in TICKERS:
+        prefix = TICKER_MAP[ticker]
+        tdf = df[df["ticker"] == ticker].copy()
+        if tdf.empty:
+            return None
+        tdf = tdf.set_index("timestamp").sort_index()
+        tdf = tdf[~tdf.index.duplicated(keep="last")]
+        dfs[prefix] = tdf
 
-print("[training] Fetching daily data...")
-df = yf.download(
-    TICKERS, period="5d", interval="1d", group_by="ticker", progress=False
-)
+    return dfs
 
-ticker_data = {}
-for ticker in TICKERS:
-    tdf = extract_ticker(df, ticker)
-    if tdf is not None:
-        ticker_data[ticker] = tdf
-        print(f"[training] {ticker}: {len(tdf)} rows")
 
-dxy = ticker_data.get("DX-Y.NYB")
-if dxy is None or dxy.empty:
-    print("[training] No DXY data fetched, aborting")
+def compute_features(dfs):
+    base_idx = set(dfs["dxy"].index)
+    for p in ["eur", "jpy", "gbp"]:
+        base_idx &= set(dfs[p].index)
+    if not base_idx:
+        return None
+    base_idx = sorted(base_idx)
+    base_df = pd.DataFrame(index=base_idx)
+
+    feat_df = pd.DataFrame(index=base_idx)
+
+    for prefix, tdf in dfs.items():
+        tdf_small = tdf[["close", "high", "low"]]
+        if prefix in ["vix", "sp500"]:
+            merged = pd.merge_asof(base_df, tdf_small, left_index=True, right_index=True, direction="backward")
+            close = merged["close"].astype(float).fillna(0)
+            hl = (merged["high"].astype(float).fillna(0) - merged["low"].astype(float).fillna(0))
+        else:
+            aligned = tdf_small.reindex(base_idx).ffill().bfill()
+            close = aligned["close"].astype(float)
+            hl = aligned["high"].astype(float) - aligned["low"].astype(float)
+        returns = close.pct_change()
+        feat_df[f"{prefix}_return"] = returns
+        feat_df[f"{prefix}_hl_pct"] = hl / close.replace(0, np.nan)
+
+    returns_mat = feat_df[[c for c in feat_df.columns if c.endswith("_return")]]
+    feat_df["dxy_roll_vol"] = returns_mat["dxy_return"].rolling(ROLLING_WINDOW).std()
+
+    for col in feat_df.columns:
+        feat_df[col] = feat_df[col].replace([np.inf, -np.inf], np.nan).clip(-5, 5)
+
+    return feat_df.dropna()
+
+
+def build_lag_features(feat_df):
+    return_cols = [f"{p}_return" for p in TICKER_MAP.values()]
+    hl_cols = [f"{p}_hl_pct" for p in TICKER_MAP.values()]
+
+    for col in return_cols:
+        for i in range(1, 4):
+            feat_df[f"{col}_lag{i}"] = feat_df[col].shift(i)
+
+    for col in hl_cols:
+        feat_df[f"{col}_lag1"] = feat_df[col].shift(1)
+
+    for i in range(1, 4):
+        feat_df[f"dxy_roll_vol_lag{i}"] = feat_df["dxy_roll_vol"].shift(i)
+
+    return feat_df.dropna()
+
+
+log.info("Starting...")
+fetch_and_store_bars()
+
+dfs = load_training_data()
+if dfs is None:
+    log.warning("Not enough data, exiting")
     exit(1)
 
-all_dates = dxy.index.sort_values()
-rows = []
-for date in all_dates:
-    row = {"date": date}
-    for ticker, tdf in ticker_data.items():
-        if date in tdf.index:
-            prefix = TICKER_MAP.get(ticker, ticker)
-            trow = tdf.loc[date]
-            row[f"{prefix}_close"] = float(trow["Close"])
-            row[f"{prefix}_high"] = float(trow["High"])
-            row[f"{prefix}_low"] = float(trow["Low"])
-    rows.append(row)
+feat_df = compute_features(dfs)
+if feat_df is None:
+    log.error("Feature computation failed")
+    exit(1)
 
-new_df = pd.DataFrame(rows).set_index("date")
-new_df["dxy_volatility"] = new_df["dxy_high"] - new_df["dxy_low"]
-
-if os.path.exists(DATA_PATH):
-    train_df = joblib.load(DATA_PATH)
-    combined = pd.concat([train_df, new_df])
-    combined = combined[~combined.index.duplicated(keep="last")]
-    combined = combined.sort_index()
-else:
-    combined = new_df.sort_index()
-    print("[training] No saved training data, starting fresh")
-
-if len(combined) > 100:
-    combined = combined.iloc[-100:]
-
-LAG_COLS = [
-    "eur_close", "jpy_close", "gbp_close",
-    "vix_close", "sp500_close", "dxy_close",
-]
-for col in LAG_COLS:
-    if col not in combined.columns:
-        combined[col] = 0
-    for i in range(1, 4):
-        combined[f"{col}_lag{i}"] = combined[col].shift(i)
-
-combined["dxy_volatility_lag1"] = combined["dxy_volatility"].shift(1)
+feat_df = build_lag_features(feat_df)
+if len(feat_df) < 5:
+    log.warning("Only %d feature rows, need >= 5", len(feat_df))
+    exit(1)
 
 FEATURE_COLS = (
-    [f"{c}_lag{i}" for c in LAG_COLS for i in range(1, 4)]
-    + ["dxy_volatility_lag1"]
+    [f"{p}_return_lag{i}" for p in TICKER_MAP.values() for i in range(1, 4)]
+    + [f"{p}_hl_pct_lag1" for p in TICKER_MAP.values()]
+    + ["dxy_roll_vol_lag1", "dxy_roll_vol_lag2", "dxy_roll_vol_lag3"]
 )
 
-train_data = combined.dropna()
+X = feat_df[FEATURE_COLS].values
+y = feat_df["dxy_roll_vol"].values
 
-if len(train_data) >= 3:
-    X_cols = [c for c in FEATURE_COLS if c in train_data.columns]
-    X = train_data[X_cols].values
-    y = train_data["dxy_volatility"].values
+model = Ridge(alpha=1.0)
+model.fit(X, y)
+joblib.dump(model, MODEL_PATH)
+log.info("Vol model trained on %d rows, %d features", len(feat_df), len(FEATURE_COLS))
 
-    model = Ridge(alpha=1.0)
-    model.fit(X, y)
-    joblib.dump(model, MODEL_PATH)
-    joblib.dump(combined, DATA_PATH)
-
-    print(f"[training] Model trained on {len(train_data)} rows")
+dxy_close_series = dfs["dxy"]["close"]
+dxy_rets = dxy_close_series.pct_change()
+price_targets = pd.DataFrame(index=dxy_close_series.index)
+price_targets["return_t1"] = dxy_rets.shift(-1)
+price_targets["return_t3"] = dxy_rets.rolling(3).sum().shift(-3)
+price_targets["return_t5"] = dxy_rets.rolling(5).sum().shift(-5)
+price_targets = price_targets.dropna()
+common_idx = feat_df.index.intersection(price_targets.index)
+if len(common_idx) >= 5:
+    X_price = feat_df.loc[common_idx, FEATURE_COLS].values
+    y_price = price_targets.loc[common_idx].values
+    price_model = Ridge(alpha=1.0)
+    price_model.fit(X_price, y_price)
+    PRICE_MODEL_PATH = MODEL_PATH.replace(".pkl", "_price.pkl")
+    joblib.dump(price_model, PRICE_MODEL_PATH)
+    log.info("Price model trained on %d rows, 3 targets (t+1, t+3, t+5)", len(common_idx))
 else:
-    print(f"[training] Insufficient data ({len(train_data)} rows), loading existing model")
-    if os.path.exists(MODEL_PATH):
-        model = joblib.load(MODEL_PATH)
-    else:
-        print("[training] No model available, using heuristic")
-        model = None
+    price_model = None
+    log.warning("Not enough price data (%d rows), skipping price model", len(common_idx))
 
-latest = combined.iloc[-1:].copy()
-if "dxy_volatility_lag1" not in latest.columns:
-    latest["dxy_volatility_lag1"] = combined["dxy_volatility"].iloc[-2] if len(combined) >= 2 else 0
+latest = feat_df.iloc[-1:]
 
-for col in LAG_COLS:
-    for i in range(1, 4):
-        lagcol = f"{col}_lag{i}"
-        if lagcol not in latest.columns:
-            idx = -i
-            if len(combined) >= abs(idx):
-                latest[lagcol] = combined[col].iloc[idx]
-            else:
-                latest[lagcol] = 0
+pred_X = latest[FEATURE_COLS].values
+predicted_vol = float(model.predict(pred_X)[0])
+predicted_vol = max(predicted_vol, 0)
 
-if model is not None:
-    pred_X = latest[[c for c in FEATURE_COLS if c in latest.columns]].values
-    if not np.any(np.isnan(pred_X)):
-        predicted_vol = float(model.predict(pred_X)[0])
-    else:
-        predicted_vol = float(latest["dxy_volatility"].iloc[0]) if "dxy_volatility" in latest.columns else 0
-else:
-    predicted_vol = float(latest["dxy_volatility"].iloc[0]) if "dxy_volatility" in latest.columns else 0
+actual_vol = float(latest["dxy_roll_vol"].iloc[0])
+dxy_latest = dfs["dxy"].loc[latest.index[0]]
+dxy_close = float(dxy_latest["close"])
 
-actual_vol = float(latest["dxy_volatility"].iloc[0]) if "dxy_volatility" in latest.columns else None
-dxy_close = float(latest["dxy_close"].iloc[0]) if "dxy_close" in latest.columns else 0
+features = {col: float(latest[col].iloc[0]) for col in feat_df.columns if col != "date"}
 
-features = {}
-for col in latest.columns:
-    if col != "date":
-        features[col] = float(latest[col].iloc[0])
+pred_price_1m = pred_price_3m = pred_price_5m = None
+if price_model is not None:
+    price_X = latest[FEATURE_COLS].values
+    price_raw = price_model.predict(price_X)[0]
+    last_close = dxy_close
+    pred_price_1m = round(last_close * (1 + price_raw[0]), 4)
+    pred_price_3m = round(last_close * (1 + price_raw[1]), 4)
+    pred_price_5m = round(last_close * (1 + price_raw[2]), 4)
 
 result = {
     "timestamp": datetime.now(timezone.utc).isoformat(),
     "dxy_close": round(dxy_close, 4),
-    "predicted_volatility": round(max(predicted_vol, 0), 4),
-    "actual_volatility": round(actual_vol, 4) if actual_vol is not None else None,
+    "predicted_volatility": round(predicted_vol, 6),
+    "actual_volatility": round(actual_vol, 6),
+    "predicted_price_1m": pred_price_1m,
+    "predicted_price_3m": pred_price_3m,
+    "predicted_price_5m": pred_price_5m,
     "source": "batch",
-    "features": {k: round(v, 4) if isinstance(v, float) else v for k, v in features.items()},
+    "features": {k: round(v, 6) if isinstance(v, float) else v for k, v in features.items()},
 }
 
 producer.send("dxy-predictions", value=result)
-print(f"[training] Prediction sent: predicted_vol={predicted_vol:.4f} actual_vol={actual_vol}")
+log.info("pred_vol=%.6f actual_vol=%.6f", predicted_vol, actual_vol)
 
 updates = {}
-for prefix_key in ["eur", "jpy", "gbp", "vix", "sp500", "dxy"]:
-    close_val = features.get(f"{prefix_key}_close")
-    if close_val is not None:
-        updates[f"latest:{prefix_key}:close"] = str(close_val)
+for prefix in TICKER_MAP.values():
+    tdf = dfs.get(prefix)
+    if tdf is None:
+        continue
+    last = tdf.iloc[-1]
+    updates[f"latest:{prefix}:close"] = str(float(last["close"]))
+    updates[f"latest:{prefix}:high"] = str(float(last["high"]))
+    updates[f"latest:{prefix}:low"] = str(float(last["low"]))
 
-updates["latest:dxy:high"] = str(features.get("dxy_high", ""))
-updates["latest:dxy:low"] = str(features.get("dxy_low", ""))
-updates["latest:dxy:volatility"] = str(features.get("dxy_volatility", ""))
-updates["latest:dxy:timestamp"] = result["timestamp"]
+updates["latest:dxy:volatility"] = str(actual_vol)
 
 with r.pipeline() as pipe:
     for k, v in updates.items():
         pipe.set(k, v)
+    for prefix in TICKER_MAP.values():
+        tdf = dfs.get(prefix)
+        if tdf is None:
+            continue
+        for val in tdf["close"].astype(float).values:
+            pipe.rpush(f"history:{prefix}:close", float(val))
+        pipe.ltrim(f"history:{prefix}:close", -50, -1)
     pipe.execute()
 
-print(f"[training] Dragonfly cache updated with {len(updates)} keys")
+log.info("Dragonfly cache updated")

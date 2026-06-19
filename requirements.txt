@@ -9,3 +9,4 @@ joblib==1.4.2
 prefect==3.2.0
 asyncpg==0.30.0
 importlib-metadata==8.5.0
+streamlit==1.42.0
