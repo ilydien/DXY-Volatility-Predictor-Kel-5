@@ -227,24 +227,9 @@ docker compose exec postgres psql -U gold -d golddb -c "SELECT * FROM batch_metr
 
 ## Environment Variables
 
-Lihat `.env` untuk konfigurasi lengkap:
+Lihat `.env.example` untuk daftar lengkap environment variables beserta deskripsi dan default value.
 
-| Variable | Default | Deskripsi |
-|----------|---------|-----------|
-| `POSTGRES_USER` | gold | PostgreSQL user |
-| `POSTGRES_PASSWORD` | gold | PostgreSQL password |
-| `POSTGRES_DB` | golddb | PostgreSQL database |
-| `KAFKA_BOOTSTRAP_SERVERS` | kafka:9092 | Kafka broker |
-| `DRAGONFLY_HOST` | dragonfly | Dragonfly cache host |
-| `DRAGONFLY_PASSWORD` | (empty) | Dragonfly auth password |
-| `DASHBOARD_PASSWORD` | dxy2024 | Streamlit dashboard password |
-| `GRAFANA_PASSWORD` | admin | Grafana admin password |
-| `TELEGRAM_BOT_TOKEN` | - | Telegram bot token untuk alerting |
-| `TELEGRAM_CHAT_ID` | - | Chat ID tujuan alert |
-| `ALERT_THRESHOLD` | 0.001 | Threshold volatilitas untuk WARNING |
-
-> Semua kredensial disimpan di `.env` (tidak di-commit ke git via `.gitignore`). 
-> Untuk mengaktifkan autentikasi, isi password yang sesuai. Default digunakan jika tidak diisi.
+> Semua kredensial disimpan di `.env` (tidak di-commit ke git via `.gitignore`). Salin `.env.example` ke `.env` dan isi password yang sesuai.
 
 ## Metadata Database
 
