@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from kafka import KafkaProducer
 import yfinance as yf
 import pandas as pd
+from prometheus_client import start_http_server, Counter, Gauge
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 log = logging.getLogger("ws_listener")
@@ -32,6 +33,11 @@ def get_kafka_producer():
 
 producer = get_kafka_producer()
 
+PUBLISHED_TOTAL = Counter("ws_listener_published_total", "Messages published")
+ERRORS = Counter("ws_listener_errors_total", "Total errors")
+LAST_SUCCESS = Gauge("ws_listener_last_success_seconds", "Last success timestamp")
+start_http_server(8004)
+
 
 def send_price(ticker, price, ts=None, high=None, low=None):
     entry = {"close": float(price), "source": "ws"}
@@ -46,6 +52,8 @@ def send_price(ticker, price, ts=None, high=None, low=None):
         "data": {ticker: entry},
     }
     producer.send("market-data", value=data)
+    PUBLISHED_TOTAL.inc()
+    LAST_SUCCESS.set(time.time())
     log.info("%s: %s", ticker, price)
 
 
@@ -66,6 +74,7 @@ def poll_forever():
                     low=float(last["Low"]),
                 )
         except Exception as e:
+            ERRORS.inc()
             log.error("Poll error: %s", e)
         time.sleep(POLL_INTERVAL)
 

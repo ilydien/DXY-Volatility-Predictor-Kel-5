@@ -1,0 +1,21 @@
+name: dxy_pipeline
+version: 1.0
+profile: dxy_pipeline
+model-paths:
+  - models
+analysis-paths:
+  - analyses
+test-paths:
+  - tests
+seed-paths:
+  - seeds
+macro-paths:
+  - macros
+snapshot-paths:
+  - snapshots
+clean-targets:
+  - target
+  - dbt_packages
+models:
+  dxy_pipeline:
+    +materialized: view

@@ -4,9 +4,10 @@ import psycopg2
 import pandas as pd
 
 DRAGONFLY_HOST = os.getenv("DRAGONFLY_HOST", "dragonfly")
+DRAGONFLY_PASSWORD = os.getenv("DRAGONFLY_PASSWORD", "")
 POSTGRES_DSN = os.getenv("POSTGRES_DSN", "postgresql://gold:gold@postgres:5432/golddb")
 
-r = redis.Redis(host=DRAGONFLY_HOST, port=6379, decode_responses=True)
+r = redis.Redis(host=DRAGONFLY_HOST, port=6379, password=DRAGONFLY_PASSWORD, decode_responses=True)
 
 PREFIX_MAP = {
     "dxy": "DXY",
@@ -31,7 +32,7 @@ def get_latest_prices():
 
 
 def get_latest_vol():
-    pred = r.get("latest:dxy:predicted_volatility")
+    pred = r.get("latest:dxy:batch_predicted_volatility")
     inst = r.get("latest:dxy:instant_volatility")
     return {
         "predicted": float(pred) if pred else None,
@@ -39,11 +40,13 @@ def get_latest_vol():
     }
 
 
-def get_predictions_24h(limit=100):
+def get_predictions_24h(limit=100, source=None):
     conn = get_conn()
+    source_filter = f"AND source = '{source}'" if source else ""
     query = f"""
     SELECT timestamp, predicted_close, actual_close
     FROM predictions
+    WHERE predicted_close IS NOT NULL {source_filter}
     ORDER BY timestamp DESC
     LIMIT {limit}
     """
@@ -117,22 +120,25 @@ def get_price_pred_history():
 def get_actual_vs_predicted_pg(hours=12):
     conn = get_conn()
     df = pd.read_sql(f"""
-        SELECT ib.timestamp, ib.close AS actual_close, p.pred_price_1m
-        FROM intraday_bars ib
-        LEFT JOIN LATERAL (
-            SELECT pred_price_1m FROM predictions
-            WHERE timestamp <= ib.timestamp
-            ORDER BY timestamp DESC LIMIT 1
-        ) p ON true
-        WHERE ib.ticker = 'DX-Y.NYB'
-          AND ib.timestamp >= NOW() - INTERVAL '{hours} hours'
-        ORDER BY ib.timestamp
+        SELECT timestamp, close AS actual_close, NULL AS pred_price_1m
+        FROM intraday_bars
+        WHERE ticker = 'DX-Y.NYB'
+          AND timestamp >= NOW() - INTERVAL '{hours} hours'
+
+        UNION ALL
+
+        SELECT timestamp, dxy_close AS actual_close, pred_price_1m
+        FROM predictions
+        WHERE dxy_close IS NOT NULL
+          AND timestamp >= NOW() - INTERVAL '{hours} hours'
+
+        ORDER BY timestamp
     """, conn)
     conn.close()
     if df.empty:
         return pd.DataFrame()
     df["timestamp"] = pd.to_datetime(df["timestamp"])
-    actual = df[["timestamp", "actual_close"]].rename(columns={"actual_close": "price"})
+    actual = df[df["actual_close"].notna()][["timestamp", "actual_close"]].rename(columns={"actual_close": "price"})
     actual["type"] = "Actual"
     predicted = df[df["pred_price_1m"].notna()][["timestamp", "pred_price_1m"]].rename(columns={"pred_price_1m": "price"})
     predicted["type"] = "Predicted"

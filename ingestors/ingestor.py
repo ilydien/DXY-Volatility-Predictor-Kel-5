@@ -13,6 +13,7 @@ log = logging.getLogger("ingestor")
 TICKERS = os.getenv("TICKERS", "DX-Y.NYB,EURUSD=X,USDJPY=X,GBPUSD=X,^VIX,^GSPC").split(",")
 KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
 DRAGONFLY_HOST = os.getenv("DRAGONFLY_HOST", "dragonfly")
+DRAGONFLY_PASSWORD = os.getenv("DRAGONFLY_PASSWORD", "")
 
 producer = KafkaProducer(
     bootstrap_servers=KAFKA_BOOTSTRAP,
@@ -20,7 +21,7 @@ producer = KafkaProducer(
     acks=1,
 )
 
-r = redis.Redis(host=DRAGONFLY_HOST, port=6379, decode_responses=True)
+r = redis.Redis(host=DRAGONFLY_HOST, port=6379, password=DRAGONFLY_PASSWORD, decode_responses=True)
 
 
 def fetch_and_publish():

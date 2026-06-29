@@ -5,12 +5,14 @@ import time
 from kafka import KafkaConsumer
 import redis
 import psycopg2
+from prometheus_client import start_http_server, Counter, Gauge
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 log = logging.getLogger("sink")
 
 KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
 DRAGONFLY_HOST = os.getenv("DRAGONFLY_HOST", "dragonfly")
+DRAGONFLY_PASSWORD = os.getenv("DRAGONFLY_PASSWORD", "")
 POSTGRES_DSN = os.getenv("POSTGRES_DSN", "postgresql://gold:gold@postgres:5432/golddb")
 
 
@@ -33,7 +35,7 @@ def get_kafka_consumer():
 
 consumer = get_kafka_consumer()
 
-r = redis.Redis(host=DRAGONFLY_HOST, port=6379, decode_responses=True)
+r = redis.Redis(host=DRAGONFLY_HOST, port=6379, password=DRAGONFLY_PASSWORD, decode_responses=True)
 
 
 def get_db():
@@ -47,6 +49,11 @@ def get_db():
 
 
 conn, cur = get_db()
+
+MESSAGES_TOTAL = Counter("sink_messages_total", "Messages processed")
+ERRORS = Counter("sink_errors_total", "Total errors")
+LAST_SUCCESS = Gauge("sink_last_success_seconds", "Last success timestamp")
+start_http_server(8003)
 
 log.info("Waiting for predictions on 'dxy-predictions'...")
 for msg in consumer:
@@ -66,9 +73,13 @@ for msg in consumer:
         if predicted is None:
             continue
 
+        if source == "batch":
+            r.set("latest:dxy:batch_predicted_volatility", predicted)
         r.set("latest:dxy:predicted_volatility", predicted)
         r.set("latest:dxy:predicted_timestamp", ts)
         r.set("latest:dxy:close", dxy_close)
+        r.rpush("history:dxy:close", dxy_close)
+        r.ltrim("history:dxy:close", -200, -1)
 
         if pred_price_1m is not None:
             r.set("latest:dxy:pred_price_1m", pred_price_1m)
@@ -95,8 +106,8 @@ for msg in consumer:
 
         cur.execute(
             """
-            INSERT INTO predictions (timestamp, predicted_close, actual_close, pred_price_1m, pred_price_3m, pred_price_5m, pred_price_30m, features)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            INSERT INTO predictions (timestamp, predicted_close, actual_close, pred_price_1m, pred_price_3m, pred_price_5m, pred_price_30m, dxy_close, features, source)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """,
             (
                 ts,
@@ -106,12 +117,17 @@ for msg in consumer:
                 pred_price_3m,
                 pred_price_5m,
                 pred_price_30m,
+                dxy_close,
                 json.dumps(body.get("features", {})),
+                source,
             ),
         )
         conn.commit()
 
+        MESSAGES_TOTAL.inc()
+        LAST_SUCCESS.set(time.time())
         log.info("source=%s pred_vol=%.4f actual_vol=%s", source, predicted, actual)
 
     except Exception as e:
+        ERRORS.inc()
         print(f"[sink] Error: {e}")

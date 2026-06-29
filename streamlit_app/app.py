@@ -2,7 +2,9 @@ import streamlit as st
 import pandas as pd
 import altair as alt
 import time
+import os
 from datetime import datetime, timezone
+from prometheus_client import start_http_server, Counter, Gauge
 
 from db import (
     get_latest_prices, get_latest_vol, get_predictions_24h,
@@ -15,15 +17,31 @@ REFRESH_SECONDS = 2
 
 st.set_page_config(page_title="DXY Volatility Dashboard", layout="wide", page_icon="📊")
 
+DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "dxy2024")
+if "authed" not in st.session_state:
+    st.session_state.authed = False
+
+if not st.session_state.authed:
+    st.title("DXY Dashboard")
+    pwd = st.text_input("Password", type="password")
+    if st.button("Login"):
+        if pwd == DASHBOARD_PASSWORD:
+            st.session_state.authed = True
+            st.rerun()
+        else:
+            st.error("Wrong password")
+    st.stop()
+
 st.sidebar.title("DXY Dashboard")
 threshold = st.sidebar.slider(
     "Volatility Alert Threshold",
     min_value=0.0, max_value=0.01, value=0.001, step=0.0001,
     format="%.4f",
 )
-chart_hours = st.sidebar.slider(
-    "Price Chart (PostgreSQL hours)",
-    min_value=1, max_value=48, value=8, step=1,
+r.set("latest:dxy:alert_threshold", threshold)
+chart_minutes = st.sidebar.slider(
+    "Price Chart (minutes)",
+    min_value=10, max_value=2880, value=480, step=5,
 )
 
 SHORT_LABELS = {
@@ -35,13 +53,24 @@ SHORT_LABELS = {
     "S&P 500": "SPX",
 }
 
+@st.cache_resource
+def init_prometheus():
+    refreshes = Counter("dashboard_refreshes_total", "Total refreshes")
+    errors = Counter("dashboard_errors_total", "Total errors")
+    last_ok = Gauge("dashboard_last_success_seconds", "Last success timestamp")
+    start_http_server(8005)
+    return refreshes, errors, last_ok
+
+REFRESHES_TOTAL, ERRORS, LAST_SUCCESS = init_prometheus()
+
 main = st.empty()
 
 while True:
+    REFRESHES_TOTAL.inc()
+    LAST_SUCCESS.set(time.time())
     now = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
     prices = get_latest_prices()
     vol = get_latest_vol()
-    df_pred = get_predictions_24h()
     features = get_recent_features()
     alert_state = get_alert_state(r)
 
@@ -65,12 +94,8 @@ while True:
             )
 
         vol_col1, vol_col2 = st.columns(2)
-        vol_col1.metric("Predicted Volatility", f"{predicted_vol:.6f}", border=True)
-        vol_col2.metric(
-            "Instant Volatility", f"{inst_vol:.6f}",
-            delta=f"{(inst_vol - predicted_vol):.6f}" if predicted_vol else None,
-            border=True,
-        )
+        vol_col1.metric("Predicted Volatility (Batch)", f"{predicted_vol:.6f}", border=True)
+        vol_col2.metric("Instant Volatility (Stream)", f"{inst_vol:.6f}", border=True)
 
         alert_col1, alert_col2, alert_col3 = st.columns(3)
         emoji = "🔴" if is_alert else "🟢"
@@ -81,22 +106,39 @@ while True:
         if is_alert:
             st.warning(f"Volatility spike: {inst_vol:.6f} exceeds threshold {threshold:.4f}", icon="🚨")
 
-        st.subheader("Volatility (100 latest predictions)")
-        if not df_pred.empty:
-            df_pred["timestamp"] = pd.to_datetime(df_pred["timestamp"])
-            chart = df_pred.rename(columns={
-                "predicted_close": "Predicted",
-                "actual_close": "Actual",
-            }).set_index("timestamp")
-            cols_to_show = [c for c in ["Predicted", "Actual"] if c in chart.columns]
-            if cols_to_show:
-                st.line_chart(chart[cols_to_show])
-            st.caption(f"Span: {df_pred['timestamp'].min().strftime('%m/%d %H:%M')} → {df_pred['timestamp'].max().strftime('%m/%d %H:%M')}")
-        else:
-            st.info("No prediction data — run `docker compose exec training-flow python /app/ml_pipeline/training.py`")
+        vol_chart_col1, vol_chart_col2 = st.columns(2)
+
+        with vol_chart_col1:
+            st.subheader("Batch Volatility: Predicted vs Actual")
+            df_batch = get_predictions_24h(limit=100, source="batch")
+            if not df_batch.empty:
+                df_batch["timestamp"] = pd.to_datetime(df_batch["timestamp"])
+                chart = df_batch.rename(columns={
+                    "predicted_close": "Predicted",
+                    "actual_close": "Actual",
+                }).set_index("timestamp")
+                cols_to_show = [c for c in ["Predicted", "Actual"] if c in chart.columns]
+                if cols_to_show:
+                    st.line_chart(chart[cols_to_show])
+                st.caption(f"Span: {df_batch['timestamp'].min().strftime('%m/%d %H:%M')} → {df_batch['timestamp'].max().strftime('%m/%d %H:%M')}")
+            else:
+                st.info("No batch predictions yet")
+
+        with vol_chart_col2:
+            st.subheader("Stream Instant Volatility")
+            df_stream = get_predictions_24h(limit=100, source="stream")
+            if not df_stream.empty:
+                df_stream["timestamp"] = pd.to_datetime(df_stream["timestamp"])
+                chart = df_stream.rename(columns={
+                    "actual_close": "Instant Vol",
+                }).set_index("timestamp")
+                st.line_chart(chart[["Instant Vol"]])
+                st.caption(f"Span: {df_stream['timestamp'].min().strftime('%m/%d %H:%M')} → {df_stream['timestamp'].max().strftime('%m/%d %H:%M')}")
+            else:
+                st.info("No stream predictions yet")
 
         st.subheader("DXY Price — Actual vs Predicted")
-        df_ap = get_actual_vs_predicted_pg(hours=chart_hours)
+        df_ap = get_actual_vs_predicted_pg(hours=chart_minutes / 60)
         preds = get_latest_price_preds()
         if not df_ap.empty:
             chart_data = df_ap
@@ -109,17 +151,23 @@ while True:
                         pred_rows.append({"timestamp": last_ts + pd.Timedelta(minutes=offset), "price": val, "type": label})
                 if pred_rows:
                     chart_data = pd.concat([chart_data, pd.DataFrame(pred_rows)], ignore_index=True)
-            chart = alt.Chart(chart_data).mark_line(point=True).encode(
+            zoom = alt.selection_interval(bind="scales")
+            chart = alt.Chart(chart_data).mark_line(point=True).add_params(zoom).encode(
                 x=alt.X("timestamp:T", title="Time", axis=alt.Axis(format="%H:%M", grid=False)),
                 y=alt.Y("price:Q", title="DXY Price", scale=alt.Scale(zero=False)),
                 color=alt.Color("type:N", scale=alt.Scale(
                     domain=["Actual", "Predicted", "Pred 1m", "Pred 3m", "Pred 5m", "Pred 30m"],
-                    range=["#00cc66", "#ff6600", "#ffcc00", "#ff8800", "#ff3300", "#9933ff"],
+                    range=["#00cc66", "#ff0000", "#ffcc00", "#ff8800", "#ff3300", "#9933ff"],
                 )),
                 strokeDash=alt.StrokeDash("type:N", scale=alt.Scale(
                     domain=["Actual", "Predicted", "Pred 1m", "Pred 3m", "Pred 5m", "Pred 30m"],
-                    range=[[0], [0], [6, 3], [6, 3], [6, 3], [4, 4]],
+                    range=[[0], [6, 3], [6, 3], [6, 3], [6, 3], [4, 4]],
                 )),
+                opacity=alt.condition(
+                    alt.datum.type == "Predicted",
+                    alt.value(0.4),
+                    alt.value(1.0)
+                ),
             ).properties(height=400)
             st.altair_chart(chart, use_container_width=True)
         else:

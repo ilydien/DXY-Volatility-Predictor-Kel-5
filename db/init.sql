@@ -27,6 +27,7 @@ CREATE TABLE IF NOT EXISTS predictions (
     pred_price_3m DOUBLE PRECISION,
     pred_price_5m DOUBLE PRECISION,
     pred_price_30m DOUBLE PRECISION,
+    dxy_close DOUBLE PRECISION,
     features JSONB
 );
 
@@ -58,3 +59,31 @@ COMMENT ON COLUMN intraday_bars.timestamp IS 'UTC open time of the 1-minute bar'
 COMMENT ON COLUMN intraday_bars.close IS 'Close price of the 1-minute bar';
 
 ALTER TABLE predictions ADD COLUMN IF NOT EXISTS pred_price_30m DOUBLE PRECISION;
+ALTER TABLE predictions ADD COLUMN IF NOT EXISTS source VARCHAR(20);
+ALTER TABLE predictions ADD COLUMN IF NOT EXISTS dxy_close DOUBLE PRECISION;
+
+CREATE TABLE IF NOT EXISTS batch_metrics (
+    id SERIAL PRIMARY KEY,
+    timestamp TIMESTAMPTZ DEFAULT NOW(),
+    predicted_vol DOUBLE PRECISION,
+    actual_vol DOUBLE PRECISION,
+    success BOOLEAN,
+    error_message TEXT
+);
+COMMENT ON TABLE batch_metrics IS 'Batch predictor cycle results. Used for monitoring in Grafana.';
+
+CREATE TABLE IF NOT EXISTS dbt_test_results (
+    id SERIAL PRIMARY KEY,
+    run_at TIMESTAMPTZ DEFAULT NOW(),
+    models_found INTEGER,
+    tests_total INTEGER,
+    passed INTEGER,
+    warnings INTEGER,
+    errors INTEGER,
+    skipped INTEGER,
+    duration_seconds DOUBLE PRECISION,
+    success BOOLEAN,
+    raw_output TEXT
+);
+
+COMMENT ON TABLE dbt_test_results IS 'dbt test run history. Used for data quality monitoring in Grafana. Owner: pipeline@project-akhir-ipbd';

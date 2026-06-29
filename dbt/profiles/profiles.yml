@@ -1,0 +1,12 @@
+dxy_pipeline:
+  outputs:
+    dev:
+      type: postgres
+      threads: 4
+      host: "{{ env_var('DBT_HOST', 'postgres') }}"
+      port: "{{ env_var('DBT_PORT', '5432') | int }}"
+      user: "{{ env_var('DBT_USER', 'gold') }}"
+      password: "{{ env_var('DBT_PASSWORD', 'gold') }}"
+      dbname: "{{ env_var('DBT_DATABASE', 'golddb') }}"
+      schema: public
+  target: dev

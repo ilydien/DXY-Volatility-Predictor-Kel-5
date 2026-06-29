@@ -28,6 +28,7 @@ TICKER_MAP = {
 
 KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
 DRAGONFLY_HOST = os.getenv("DRAGONFLY_HOST", "dragonfly")
+DRAGONFLY_PASSWORD = os.getenv("DRAGONFLY_PASSWORD", "")
 POSTGRES_DSN = os.getenv("POSTGRES_DSN", "postgresql://gold:gold@postgres:5432/golddb")
 MODEL_PATH = os.getenv("MODEL_PATH", "/app/models/dxy_model.pkl")
 ROLLING_WINDOW = int(os.getenv("ROLLING_WINDOW", "20"))
@@ -49,7 +50,7 @@ producer = KafkaProducer(
     value_serializer=lambda v: json.dumps(v, default=str).encode(),
     acks=1,
 )
-r = redis.Redis(host=DRAGONFLY_HOST, port=6379, decode_responses=True)
+r = redis.Redis(host=DRAGONFLY_HOST, port=6379, password=DRAGONFLY_PASSWORD, decode_responses=True)
 conn, cur = get_db()
 
 
@@ -93,7 +94,7 @@ def load_training_data():
     query = """
     SELECT ticker, timestamp, open, high, low, close
     FROM intraday_bars
-    WHERE timestamp >= NOW() - INTERVAL '30 days'
+    WHERE timestamp >= NOW() - INTERVAL '7 days'
     ORDER BY ticker, timestamp
     """
     cur.execute(query)
@@ -150,19 +151,27 @@ def compute_features(dfs):
 
     returns_mat = feat_df[[c for c in feat_df.columns if c.endswith("_return")]]
     dxy_ret = returns_mat["dxy_return"]
-    feat_df["dxy_roll_vol"] = dxy_ret.rolling(ROLLING_WINDOW).std()
-    feat_df["dxy_roll_vol_60"] = dxy_ret.rolling(60).std()
-    feat_df["dxy_roll_vol_120"] = dxy_ret.rolling(120).std()
+    feat_df["dxy_roll_vol"] = dxy_ret.rolling(ROLLING_WINDOW, min_periods=5).std()
+    feat_df["dxy_roll_vol_60"] = dxy_ret.rolling(60, min_periods=5).std()
+    feat_df["dxy_roll_vol_120"] = dxy_ret.rolling(120, min_periods=5).std()
 
     hl_pct = ((dfs["dxy"]["high"] - dfs["dxy"]["low"]) / dfs["dxy"]["close"])
     hl_pct = hl_pct.reindex(base_idx).fillna(0).astype(float)
     feat_df["dxy_hl_range"] = hl_pct
-    feat_df["dxy_roll_hl_range"] = feat_df["dxy_hl_range"].rolling(ROLLING_WINDOW).mean()
+    feat_df["dxy_roll_hl_range"] = feat_df["dxy_hl_range"].rolling(ROLLING_WINDOW, min_periods=5).mean()
 
     for col in feat_df.columns:
         feat_df[col] = feat_df[col].replace([np.inf, -np.inf], np.nan).clip(-5, 5)
 
     return feat_df.dropna()
+
+
+def add_time_features(feat_df):
+    hour = feat_df.index.hour
+    feat_df["sin_hour"] = np.sin(2 * np.pi * hour / 24)
+    feat_df["cos_hour"] = np.cos(2 * np.pi * hour / 24)
+    feat_df["is_weekend"] = (feat_df.index.dayofweek >= 5).astype(float)
+    return feat_df
 
 
 def build_lag_features(feat_df):
@@ -201,6 +210,7 @@ if feat_df is None:
     exit(1)
 
 feat_df = build_lag_features(feat_df)
+feat_df = add_time_features(feat_df)
 if len(feat_df) < 5:
     log.warning("Only %d feature rows, need >= 5", len(feat_df))
     exit(1)
@@ -212,6 +222,7 @@ FEATURE_COLS = (
     + ["dxy_roll_vol_60_lag1", "dxy_roll_vol_60_lag2", "dxy_roll_vol_60_lag3"]
     + ["dxy_roll_vol_120_lag1", "dxy_roll_vol_120_lag2", "dxy_roll_vol_120_lag3"]
     + ["vix_close_lag1"]
+    + ["sin_hour", "cos_hour", "is_weekend"]
 )
 
 X = feat_df[FEATURE_COLS].values
@@ -222,7 +233,7 @@ scaler = StandardScaler()
 X_scaled = scaler.fit_transform(X)
 joblib.dump(scaler, SCALER_PATH)
 
-model = Ridge(alpha=0.01)
+model = Ridge(alpha=0.0001)
 model.fit(X_scaled, y)
 joblib.dump(model, MODEL_PATH)
 log.info("Vol model trained on %d rows, %d features (scaled)", len(feat_df), len(FEATURE_COLS))
@@ -239,7 +250,7 @@ common_idx = feat_df.index.intersection(price_targets.index)
 if len(common_idx) >= 5:
     X_price = scaler.transform(feat_df.loc[common_idx, FEATURE_COLS].values)
     y_price = price_targets.loc[common_idx].values
-    price_model = Ridge(alpha=0.01)
+    price_model = Ridge(alpha=0.0001)
     price_model.fit(X_price, y_price)
     PRICE_MODEL_PATH = MODEL_PATH.replace(".pkl", "_price.pkl")
     joblib.dump(price_model, PRICE_MODEL_PATH)
@@ -254,7 +265,8 @@ pred_X = scaler.transform(latest[FEATURE_COLS].values)
 predicted_vol = float(model.predict(pred_X)[0]) * VOL_SCALE
 predicted_vol = max(predicted_vol, 0)
 
-actual_vol = float(latest["dxy_roll_hl_range"].iloc[0]) * VOL_SCALE
+inst_vol_str = r.get("latest:dxy:instant_volatility")
+actual_vol = float(inst_vol_str) if inst_vol_str else 0.0
 dxy_latest = dfs["dxy"].loc[latest.index[0]]
 dxy_close = float(dxy_latest["close"])
 

@@ -1,0 +1,31 @@
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: collector
+    static_configs:
+      - targets: ["intraday-collector:8000"]
+
+  - job_name: predictor
+    static_configs:
+      - targets: ["predictor:8001"]
+
+  - job_name: batch_predictor
+    static_configs:
+      - targets: ["training-flow:8002"]
+
+  - job_name: sink
+    static_configs:
+      - targets: ["sink:8003"]
+
+  - job_name: ws_listener
+    static_configs:
+      - targets: ["ws_listener:8004"]
+
+  - job_name: dashboard
+    static_configs:
+      - targets: ["dashboard:8005"]
+
+  - job_name: prefect
+    static_configs:
+      - targets: ["prefect-server:4222"]

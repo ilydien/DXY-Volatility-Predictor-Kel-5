@@ -9,6 +9,7 @@ import psycopg2
 import logging
 from datetime import datetime, timezone
 from kafka import KafkaProducer
+from prometheus_client import start_http_server, Counter, Gauge
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 log = logging.getLogger("batch_predictor")
@@ -25,6 +26,7 @@ TICKER_MAP = {
 
 KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
 DRAGONFLY_HOST = os.getenv("DRAGONFLY_HOST", "dragonfly")
+DRAGONFLY_PASSWORD = os.getenv("DRAGONFLY_PASSWORD", "")
 POSTGRES_DSN = os.getenv("POSTGRES_DSN", "postgresql://gold:gold@postgres:5432/golddb")
 MODEL_PATH = os.getenv("MODEL_PATH", "/app/models/dxy_model.pkl")
 ROLLING_WINDOW = int(os.getenv("ROLLING_WINDOW", "20"))
@@ -38,6 +40,7 @@ FEATURE_COLS = (
     + ["dxy_roll_vol_60_lag1", "dxy_roll_vol_60_lag2", "dxy_roll_vol_60_lag3"]
     + ["dxy_roll_vol_120_lag1", "dxy_roll_vol_120_lag2", "dxy_roll_vol_120_lag3"]
     + ["vix_close_lag1"]
+    + ["sin_hour", "cos_hour", "is_weekend"]
 )
 
 
@@ -103,16 +106,24 @@ def compute_features(dfs):
         feat_df["vix_close"] = vix_close_series
     returns_mat = feat_df[[c for c in feat_df.columns if c.endswith("_return")]]
     dxy_ret = returns_mat["dxy_return"]
-    feat_df["dxy_roll_vol"] = dxy_ret.rolling(ROLLING_WINDOW).std()
-    feat_df["dxy_roll_vol_60"] = dxy_ret.rolling(60).std()
-    feat_df["dxy_roll_vol_120"] = dxy_ret.rolling(120).std()
+    feat_df["dxy_roll_vol"] = dxy_ret.rolling(ROLLING_WINDOW, min_periods=5).std()
+    feat_df["dxy_roll_vol_60"] = dxy_ret.rolling(60, min_periods=5).std()
+    feat_df["dxy_roll_vol_120"] = dxy_ret.rolling(120, min_periods=5).std()
     hl_pct = ((dfs["dxy"]["high"] - dfs["dxy"]["low"]) / dfs["dxy"]["close"])
     hl_pct = hl_pct.reindex(base_idx).fillna(0).astype(float)
     feat_df["dxy_hl_range"] = hl_pct
-    feat_df["dxy_roll_hl_range"] = feat_df["dxy_hl_range"].rolling(ROLLING_WINDOW).mean()
+    feat_df["dxy_roll_hl_range"] = feat_df["dxy_hl_range"].rolling(ROLLING_WINDOW, min_periods=5).mean()
     for col in feat_df.columns:
         feat_df[col] = feat_df[col].replace([np.inf, -np.inf], np.nan).clip(-5, 5)
     return feat_df.dropna()
+
+
+def add_time_features(feat_df):
+    hour = feat_df.index.hour
+    feat_df["sin_hour"] = np.sin(2 * np.pi * hour / 24)
+    feat_df["cos_hour"] = np.cos(2 * np.pi * hour / 24)
+    feat_df["is_weekend"] = (feat_df.index.dayofweek >= 5).astype(float)
+    return feat_df
 
 
 def build_lag_features(feat_df):
@@ -132,84 +143,96 @@ def build_lag_features(feat_df):
     return feat_df.dropna()
 
 
-producer = KafkaProducer(
-    bootstrap_servers=KAFKA_BOOTSTRAP,
-    value_serializer=lambda v: json.dumps(v, default=str).encode(),
-    acks=1,
-)
-conn, cur = get_db()
-r = redis.Redis(host=DRAGONFLY_HOST, port=6379, decode_responses=True)
+def run_one_cycle(producer, conn, cur, r):
+    dfs = load_data(cur)
+    if dfs is None:
+        log.warning("Insufficient data")
+        return
 
-log.info("Starting batch predictor every %ds", PREDICT_INTERVAL)
+    feat_df = compute_features(dfs)
+    if feat_df is None or len(feat_df) < 5:
+        log.warning("Feature computation failed (%d rows)", len(feat_df) if feat_df is not None else 0)
+        return
 
-while True:
-    try:
-        dfs = load_data(cur)
-        if dfs is None:
-            log.warning("Insufficient data, retrying in %ds", PREDICT_INTERVAL)
-            time.sleep(PREDICT_INTERVAL)
-            continue
+    feat_df = build_lag_features(feat_df)
+    feat_df = add_time_features(feat_df)
+    if len(feat_df) < 1:
+        return
 
-        feat_df = compute_features(dfs)
-        if feat_df is None or len(feat_df) < 5:
-            log.warning("Feature computation failed (%d rows)", len(feat_df) if feat_df is not None else 0)
-            time.sleep(PREDICT_INTERVAL)
-            continue
+    if not os.path.exists(MODEL_PATH):
+        log.warning("Model not found at %s", MODEL_PATH)
+        return
 
-        feat_df = build_lag_features(feat_df)
-        if len(feat_df) < 1:
-            time.sleep(PREDICT_INTERVAL)
-            continue
+    model = joblib.load(MODEL_PATH)
+    price_model_path = MODEL_PATH.replace(".pkl", "_price.pkl")
+    price_model = joblib.load(price_model_path) if os.path.exists(price_model_path) else None
+    scaler_path = MODEL_PATH.replace(".pkl", "_scaler.pkl")
+    scaler = joblib.load(scaler_path) if os.path.exists(scaler_path) else None
 
-        if not os.path.exists(MODEL_PATH):
-            log.warning("Model not found at %s", MODEL_PATH)
-            time.sleep(PREDICT_INTERVAL)
-            continue
+    latest = feat_df.iloc[-1:]
+    X = latest[FEATURE_COLS].values
+    if scaler is not None:
+        X = scaler.transform(X)
+    predicted_vol = max(float(model.predict(X)[0]), 0) * VOL_SCALE
+    inst_vol_str = r.get("latest:dxy:instant_volatility")
+    actual_vol = float(inst_vol_str) if inst_vol_str else 0.0
 
-        model = joblib.load(MODEL_PATH)
-        price_model_path = MODEL_PATH.replace(".pkl", "_price.pkl")
-        price_model = joblib.load(price_model_path) if os.path.exists(price_model_path) else None
-        scaler_path = MODEL_PATH.replace(".pkl", "_scaler.pkl")
-        scaler = joblib.load(scaler_path) if os.path.exists(scaler_path) else None
+    dxy_latest = dfs["dxy"].loc[latest.index[0]]
+    dxy_close = float(dxy_latest["close"])
 
-        latest = feat_df.iloc[-1:]
-        X = latest[FEATURE_COLS].values
-        if scaler is not None:
-            X = scaler.transform(X)
-        predicted_vol = max(float(model.predict(X)[0]), 0) * VOL_SCALE
-        actual_vol = float(latest["dxy_roll_hl_range"].iloc[0]) * VOL_SCALE
+    pred_price_1m = pred_price_3m = pred_price_5m = pred_price_30m = None
+    if price_model is not None:
+        X_price = X if scaler is not None else latest[FEATURE_COLS].values
+        price_raw = price_model.predict(X_price)[0]
+        pred_price_1m = round(dxy_close * (1 + price_raw[0]), 4)
+        pred_price_3m = round(dxy_close * (1 + price_raw[1]), 4)
+        pred_price_5m = round(dxy_close * (1 + price_raw[2]), 4)
+        pred_price_30m = round(dxy_close * (1 + price_raw[3]), 4) if len(price_raw) > 3 else None
 
-        dxy_latest = dfs["dxy"].loc[latest.index[0]]
-        dxy_close = float(dxy_latest["close"])
+    features = {col: float(latest[col].iloc[0]) for col in feat_df.columns}
 
-        pred_price_1m = pred_price_3m = pred_price_5m = pred_price_30m = None
-        if price_model is not None:
-            X_price = X if scaler is not None else latest[FEATURE_COLS].values
-            price_raw = price_model.predict(X_price)[0]
-            pred_price_1m = round(dxy_close * (1 + price_raw[0]), 4)
-            pred_price_3m = round(dxy_close * (1 + price_raw[1]), 4)
-            pred_price_5m = round(dxy_close * (1 + price_raw[2]), 4)
-            pred_price_30m = round(dxy_close * (1 + price_raw[3]), 4) if len(price_raw) > 3 else None
+    result = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "dxy_close": round(dxy_close, 4),
+        "predicted_volatility": round(predicted_vol, 6),
+        "actual_volatility": round(actual_vol, 6),
+        "predicted_price_1m": pred_price_1m,
+        "predicted_price_3m": pred_price_3m,
+        "predicted_price_5m": pred_price_5m,
+        "predicted_price_30m": pred_price_30m,
+        "source": "batch",
+        "features": {k: round(v, 6) if isinstance(v, float) else v for k, v in features.items()},
+    }
 
-        features = {col: float(latest[col].iloc[0]) for col in feat_df.columns}
+    producer.send("dxy-predictions", value=result).get(timeout=5)
+    log.info("pred_vol=%.6f actual_vol=%.6f dxy=%.4f", predicted_vol, actual_vol, dxy_close)
 
-        result = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "dxy_close": round(dxy_close, 4),
-            "predicted_volatility": round(predicted_vol, 6),
-            "actual_volatility": round(actual_vol, 6),
-            "predicted_price_1m": pred_price_1m,
-            "predicted_price_3m": pred_price_3m,
-            "predicted_price_5m": pred_price_5m,
-            "predicted_price_30m": pred_price_30m,
-            "source": "batch",
-            "features": {k: round(v, 6) if isinstance(v, float) else v for k, v in features.items()},
-        }
 
-        producer.send("dxy-predictions", value=result).get(timeout=5)
-        log.info("pred_vol=%.6f actual_vol=%.6f dxy=%.4f", predicted_vol, actual_vol, dxy_close)
+if __name__ == "__main__":
+    producer = KafkaProducer(
+        bootstrap_servers=KAFKA_BOOTSTRAP,
+        value_serializer=lambda v: json.dumps(v, default=str).encode(),
+        acks=1,
+    )
+    conn, cur = get_db()
+    r = redis.Redis(host=DRAGONFLY_HOST, port=6379, password=DRAGONFLY_PASSWORD, decode_responses=True)
 
-    except Exception as e:
-        log.error("Error: %s", e)
+    CYCLES_TOTAL = Counter("batch_predictor_cycles_total", "Completed cycles")
+    ERRORS = Counter("batch_predictor_errors_total", "Total errors")
+    LAST_SUCCESS = Gauge("batch_predictor_last_success_seconds", "Last success timestamp")
+    PREDICTED_VOL = Gauge("batch_predictor_predicted_vol", "Latest predicted volatility")
+    ACTUAL_VOL = Gauge("batch_predictor_actual_vol", "Latest actual volatility")
+    start_http_server(8002)
 
-    time.sleep(PREDICT_INTERVAL)
+    log.info("Starting batch predictor every %ds", PREDICT_INTERVAL)
+
+    while True:
+        try:
+            run_one_cycle(producer, conn, cur, r)
+            CYCLES_TOTAL.inc()
+            PREDICTED_VOL.set(float(producer.bootstrap_connected()))  # placeholder
+            LAST_SUCCESS.set(time.time())
+        except Exception as e:
+            ERRORS.inc()
+            log.error("Error: %s", e)
+        time.sleep(PREDICT_INTERVAL)

@@ -4,6 +4,7 @@ import time
 import joblib
 import logging
 import numpy as np
+from prometheus_client import start_http_server, Counter, Gauge
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 log = logging.getLogger("predictor")
@@ -13,6 +14,7 @@ import redis
 
 KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
 DRAGONFLY_HOST = os.getenv("DRAGONFLY_HOST", "dragonfly")
+DRAGONFLY_PASSWORD = os.getenv("DRAGONFLY_PASSWORD", "")
 MODEL_PATH = os.getenv("MODEL_PATH", "/app/models/dxy_model.pkl")
 ROLLING_WINDOW = int(os.getenv("ROLLING_WINDOW", "20"))
 MAX_AGE_SECONDS = int(os.getenv("MAX_DATA_AGE", "120"))
@@ -31,6 +33,7 @@ FEATURE_COLS = (
     + ["dxy_roll_vol_60_lag1", "dxy_roll_vol_60_lag2", "dxy_roll_vol_60_lag3"]
     + ["dxy_roll_vol_120_lag1", "dxy_roll_vol_120_lag2", "dxy_roll_vol_120_lag3"]
     + ["vix_close_lag1"]
+    + ["sin_hour", "cos_hour", "is_weekend"]
 )
 
 ALL_PREFIXES = ["dxy", "eur", "jpy", "gbp", "vix", "sp500"]
@@ -67,7 +70,7 @@ def get_kafka_consumer():
 
 producer = get_kafka_producer()
 consumer = get_kafka_consumer()
-r = redis.Redis(host=DRAGONFLY_HOST, port=6379, decode_responses=True)
+r = redis.Redis(host=DRAGONFLY_HOST, port=6379, password=DRAGONFLY_PASSWORD, decode_responses=True)
 
 model = None
 if os.path.exists(MODEL_PATH):
@@ -165,6 +168,12 @@ def build_features(dxy_tick=None):
     vix_close = r.get("latest:vix:close")
     features["vix_close_lag1"] = float(vix_close) if vix_close else 0.0
 
+    now = datetime.now(timezone.utc)
+    hour = now.hour
+    features["sin_hour"] = np.sin(2 * np.pi * hour / 24)
+    features["cos_hour"] = np.cos(2 * np.pi * hour / 24)
+    features["is_weekend"] = 1.0 if now.weekday() >= 5 else 0.0
+
     return features
 
 
@@ -184,6 +193,13 @@ def compute_instant_vol():
 
 FORCE_PUBLISH_INTERVAL = int(os.getenv("FORCE_PUBLISH_INTERVAL", "60"))
 VOL_SCALE = float(os.getenv("VOL_SCALE", "5.5"))
+
+PREDICTIONS_TOTAL = Counter("predictor_predictions_total", "Predictions published")
+ERRORS = Counter("predictor_errors_total", "Total errors")
+LAST_SUCCESS = Gauge("predictor_last_success_seconds", "Last success timestamp")
+PREDICTED_VOL = Gauge("predictor_predicted_vol", "Latest predicted volatility")
+INSTANT_VOL = Gauge("predictor_instant_vol", "Latest instant volatility")
+start_http_server(8001)
 
 log.info("Waiting for streaming market data...")
 last_predicted = None
@@ -268,7 +284,12 @@ for msg in consumer:
             producer.send("dxy-predictions", value=result)
             last_predicted = predicted_vol
             last_publish_time = time.time()
+            PREDICTIONS_TOTAL.inc()
+            PREDICTED_VOL.set(predicted_vol)
+            INSTANT_VOL.set(inst_vol)
+            LAST_SUCCESS.set(time.time())
             log.info("pred_vol=%.6f inst_vol=%.6f", predicted_vol, inst_vol)
 
     except Exception as e:
+        ERRORS.inc()
         log.error("Error: %s", e)
