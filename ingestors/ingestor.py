@@ -27,7 +27,7 @@ r = redis.Redis(host=DRAGONFLY_HOST, port=6379, password=DRAGONFLY_PASSWORD, dec
 def fetch_and_publish():
     df = yf.download(
         TICKERS,
-        period="5d",
+        period="3mo",
         interval="1d",
         group_by="ticker",
         progress=False,
