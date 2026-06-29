@@ -1,12 +1,18 @@
 import json
+import logging
 import os
 import time
 from kafka import KafkaConsumer
 import redis
 import psycopg2
+from prometheus_client import start_http_server, Counter, Gauge
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+log = logging.getLogger("sink")
 
 KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
 DRAGONFLY_HOST = os.getenv("DRAGONFLY_HOST", "dragonfly")
+DRAGONFLY_PASSWORD = os.getenv("DRAGONFLY_PASSWORD", "")
 POSTGRES_DSN = os.getenv("POSTGRES_DSN", "postgresql://gold:gold@postgres:5432/golddb")
 
 
@@ -20,16 +26,16 @@ def get_kafka_consumer():
                 group_id="sink-group",
                 auto_offset_reset="latest",
             )
-            print(f"[sink] Connected to Kafka")
+            log.info("Connected to Kafka")
             return consumer
         except Exception as e:
-            print(f"[sink] Waiting for Kafka: {e}")
+            log.warning("Waiting for Kafka: %s", e)
             time.sleep(3)
 
 
 consumer = get_kafka_consumer()
 
-r = redis.Redis(host=DRAGONFLY_HOST, port=6379, decode_responses=True)
+r = redis.Redis(host=DRAGONFLY_HOST, port=6379, password=DRAGONFLY_PASSWORD, decode_responses=True)
 
 
 def get_db():
@@ -38,13 +44,18 @@ def get_db():
             conn = psycopg2.connect(POSTGRES_DSN)
             return conn, conn.cursor()
         except Exception as e:
-            print(f"[sink] Waiting for PostgreSQL: {e}")
+            log.warning("Waiting for PostgreSQL: %s", e)
             time.sleep(3)
 
 
 conn, cur = get_db()
 
-print("[sink] Waiting for predictions on 'dxy-predictions'...")
+MESSAGES_TOTAL = Counter("sink_messages_total", "Messages processed")
+ERRORS = Counter("sink_errors_total", "Total errors")
+LAST_SUCCESS = Gauge("sink_last_success_seconds", "Last success timestamp")
+start_http_server(8003)
+
+log.info("Waiting for predictions on 'dxy-predictions'...")
 for msg in consumer:
     try:
         body = msg.value
@@ -54,13 +65,32 @@ for msg in consumer:
         ts = body.get("timestamp")
         dxy_close = body.get("dxy_close")
         source = body.get("source", "unknown")
+        pred_price_1m = body.get("predicted_price_1m")
+        pred_price_3m = body.get("predicted_price_3m")
+        pred_price_5m = body.get("predicted_price_5m")
+        pred_price_30m = body.get("predicted_price_30m")
 
         if predicted is None:
             continue
 
+        if source == "batch":
+            r.set("latest:dxy:batch_predicted_volatility", predicted)
         r.set("latest:dxy:predicted_volatility", predicted)
         r.set("latest:dxy:predicted_timestamp", ts)
         r.set("latest:dxy:close", dxy_close)
+        r.rpush("history:dxy:close", dxy_close)
+        r.ltrim("history:dxy:close", -200, -1)
+
+        if pred_price_1m is not None:
+            r.set("latest:dxy:pred_price_1m", pred_price_1m)
+            r.set("latest:dxy:pred_price_3m", pred_price_3m)
+            r.set("latest:dxy:pred_price_5m", pred_price_5m)
+            r.set("latest:dxy:pred_price_30m", pred_price_30m)
+            r.rpush("history:dxy:pred_price_1m", pred_price_1m)
+            r.ltrim("history:dxy:pred_price_1m", -200, -1)
+            r.ltrim("history:dxy:pred_price_3m", -200, -1)
+            r.ltrim("history:dxy:pred_price_5m", -200, -1)
+            r.ltrim("history:dxy:pred_price_30m", -200, -1)
 
         r.xadd(
             "dxy-predictions",
@@ -76,19 +106,28 @@ for msg in consumer:
 
         cur.execute(
             """
-            INSERT INTO predictions (timestamp, predicted_close, actual_close, features)
-            VALUES (%s, %s, %s, %s)
+            INSERT INTO predictions (timestamp, predicted_close, actual_close, pred_price_1m, pred_price_3m, pred_price_5m, pred_price_30m, dxy_close, features, source)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """,
             (
                 ts,
                 predicted,
                 actual if actual is not None else None,
+                pred_price_1m,
+                pred_price_3m,
+                pred_price_5m,
+                pred_price_30m,
+                dxy_close,
                 json.dumps(body.get("features", {})),
+                source,
             ),
         )
         conn.commit()
 
-        print(f"[sink] source={source} pred_vol={predicted:.4f} actual_vol={actual}")
+        MESSAGES_TOTAL.inc()
+        LAST_SUCCESS.set(time.time())
+        log.info("source=%s pred_vol=%.4f actual_vol=%s", source, predicted, actual)
 
     except Exception as e:
+        ERRORS.inc()
         print(f"[sink] Error: {e}")

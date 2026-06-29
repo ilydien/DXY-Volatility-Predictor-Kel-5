@@ -1,0 +1,64 @@
+{
+  "uid": "dxy-pipeline-overview",
+  "title": "DXY Pipeline Overview",
+  "tags": ["dxy", "pipeline"],
+  "timezone": "utc",
+  "schemaVersion": 39,
+  "version": 0,
+  "refresh": "30s",
+  "time": {"from": "now-6h", "to": "now"},
+  "panels": [
+    {
+      "id": 1,
+      "title": "Batch Predicted vs Actual Volatility",
+      "type": "timeseries",
+      "datasource": {"type": "postgres", "uid": "PCC52D03280B7034C"},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+      "targets": [{
+        "format": "time_series",
+        "rawQuery": true,
+        "rawSql": "SELECT timestamp AS time, predicted_vol AS value, 'Predicted' AS metric FROM batch_metrics UNION ALL SELECT timestamp, actual_vol, 'Actual' FROM batch_metrics ORDER BY time",
+        "timeColumn": "timestamp"
+      }]
+    },
+    {
+      "id": 2,
+      "title": "dbt Test Pass/Error History",
+      "type": "timeseries",
+      "datasource": {"type": "postgres", "uid": "PCC52D03280B7034C"},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+      "targets": [{
+        "format": "time_series",
+        "rawQuery": true,
+        "rawSql": "SELECT run_at AS time, passed::float AS value, 'Passed' AS metric FROM dbt_test_results UNION ALL SELECT run_at, errors::float, 'Errors' FROM dbt_test_results ORDER BY time",
+        "timeColumn": "run_at"
+      }]
+    },
+    {
+      "id": 3,
+      "title": "dbt Test Results (Last 20 runs)",
+      "type": "table",
+      "datasource": {"type": "postgres", "uid": "PCC52D03280B7034C"},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+      "targets": [{
+        "format": "table",
+        "rawQuery": true,
+        "rawSql": "SELECT run_at, models_found, tests_total, passed, warnings, errors, skipped, ROUND(duration_seconds::numeric,2) AS dur_s, success FROM dbt_test_results ORDER BY run_at DESC LIMIT 20",
+        "timeColumn": "run_at"
+      }]
+    },
+    {
+      "id": 4,
+      "title": "Batch Predict Cycle Log",
+      "type": "table",
+      "datasource": {"type": "postgres", "uid": "PCC52D03280B7034C"},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+      "targets": [{
+        "format": "table",
+        "rawQuery": true,
+        "rawSql": "SELECT timestamp, predicted_vol, actual_vol, success FROM batch_metrics ORDER BY timestamp DESC LIMIT 20",
+        "timeColumn": "timestamp"
+      }]
+    }
+  ]
+}

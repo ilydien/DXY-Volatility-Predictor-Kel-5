@@ -1,14 +1,19 @@
 import yfinance as yf
 import pandas as pd
 import json
+import logging
 from datetime import datetime, timezone
 from kafka import KafkaProducer
 import redis
 import os
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+log = logging.getLogger("ingestor")
+
 TICKERS = os.getenv("TICKERS", "DX-Y.NYB,EURUSD=X,USDJPY=X,GBPUSD=X,^VIX,^GSPC").split(",")
 KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
 DRAGONFLY_HOST = os.getenv("DRAGONFLY_HOST", "dragonfly")
+DRAGONFLY_PASSWORD = os.getenv("DRAGONFLY_PASSWORD", "")
 
 producer = KafkaProducer(
     bootstrap_servers=KAFKA_BOOTSTRAP,
@@ -16,7 +21,7 @@ producer = KafkaProducer(
     acks=1,
 )
 
-r = redis.Redis(host=DRAGONFLY_HOST, port=6379, decode_responses=True)
+r = redis.Redis(host=DRAGONFLY_HOST, port=6379, password=DRAGONFLY_PASSWORD, decode_responses=True)
 
 
 def fetch_and_publish():
@@ -53,13 +58,13 @@ def fetch_and_publish():
             continue
 
     if not data or "DX-Y.NYB" not in data:
-        print(f"[ingestor] No DXY data at {timestamp}")
+        log.warning("No DXY data at %s", timestamp)
         return
 
     message = {"timestamp": timestamp.isoformat(), "data": data}
 
     producer.send("market-data", value=message)
-    print(f"[ingestor] Kafka: DXY={data['DX-Y.NYB']['close']}")
+    log.info("Kafka: DXY=%s", data['DX-Y.NYB']['close'])
 
     stream_entry = {"timestamp": timestamp.isoformat()}
     for ticker, ticker_data in data.items():
@@ -84,6 +89,12 @@ def fetch_and_publish():
 
     vol = data["DX-Y.NYB"]["high"] - data["DX-Y.NYB"]["low"]
     r.set("latest:dxy:volatility", vol)
+
+    for ticker_key in ["dxy", "eur", "jpy", "gbp", "vix", "sp500"]:
+        close_val = r.get(f"latest:{ticker_key}:close")
+        if close_val:
+            r.rpush(f"history:{ticker_key}:close", close_val)
+            r.ltrim(f"history:{ticker_key}:close", -10, -1)
 
     return message
 
