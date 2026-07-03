@@ -10,8 +10,9 @@ import logging
 import time
 from datetime import datetime, timezone
 from kafka import KafkaProducer
-from sklearn.linear_model import Ridge
+from sklearn.linear_model import Ridge, RidgeCV
 from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 log = logging.getLogger("training")
@@ -233,10 +234,47 @@ scaler = StandardScaler()
 X_scaled = scaler.fit_transform(X)
 joblib.dump(scaler, SCALER_PATH)
 
-model = Ridge(alpha=0.0001)
+split_idx = int(len(X_scaled) * 0.8)
+if split_idx >= 5:
+    eval_model = RidgeCV(alphas=[1e-4, 5e-4, 1e-3, 5e-3, 0.01, 0.1, 1, 10])
+    eval_model.fit(X_scaled[:split_idx], y[:split_idx])
+    y_pred_vol = eval_model.predict(X_scaled[split_idx:])
+    y_true_vol = y[split_idx:]
+
+    y_pred_persist = np.full_like(y_true_vol, y_true_vol[0])
+    persist_mae = mean_absolute_error(y_true_vol, y_pred_persist)
+
+    r2_vol = r2_score(y_true_vol, y_pred_vol)
+    mae_vol = mean_absolute_error(y_true_vol, y_pred_vol)
+    rmse_vol = np.sqrt(mean_squared_error(y_true_vol, y_pred_vol))
+    mape_vol = np.mean(np.abs((y_true_vol - y_pred_vol) / (y_true_vol + 1e-10))) * 100
+
+    log.info(
+        "Vol model eval — R²=%.4f, MAE=%.6f, RMSE=%.6f, MAPE=%.2f%% | Persistence MAE=%.6f",
+        r2_vol, mae_vol, rmse_vol, mape_vol, persist_mae,
+    )
+
+    try:
+        conn.rollback()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS training_metrics (
+                timestamp TIMESTAMPTZ DEFAULT NOW(),
+                model_type TEXT,
+                r2 FLOAT, mae FLOAT, rmse FLOAT, mape FLOAT
+            )
+        """)
+        cur.execute(
+            "INSERT INTO training_metrics (model_type, r2, mae, rmse, mape) VALUES (%s, %s, %s, %s, %s)",
+            ("volatility", float(round(r2_vol, 6)), float(round(mae_vol, 8)), float(round(rmse_vol, 8)), float(round(mape_vol, 4))),
+        )
+        conn.commit()
+    except Exception as e:
+        log.warning("Failed to save vol metrics: %s", e)
+
+model = RidgeCV(alphas=[1e-4, 5e-4, 1e-3, 5e-3, 0.01, 0.1, 1, 10])
 model.fit(X_scaled, y)
 joblib.dump(model, MODEL_PATH)
-log.info("Vol model trained on %d rows, %d features (scaled)", len(feat_df), len(FEATURE_COLS))
+log.info("Vol model trained on %d rows, %d features (scaled), best_alpha=%.6f", len(feat_df), len(FEATURE_COLS), model.alpha_)
 
 dxy_close_series = dfs["dxy"]["close"]
 dxy_rets = dxy_close_series.pct_change()
@@ -250,11 +288,39 @@ common_idx = feat_df.index.intersection(price_targets.index)
 if len(common_idx) >= 5:
     X_price = scaler.transform(feat_df.loc[common_idx, FEATURE_COLS].values)
     y_price = price_targets.loc[common_idx].values
-    price_model = Ridge(alpha=0.0001)
+
+    split_px = int(len(X_price) * 0.8)
+    if split_px >= 5:
+        eval_price = RidgeCV(alphas=[1e-4, 5e-4, 1e-3, 5e-3, 0.01, 0.1, 1, 10])
+        eval_price.fit(X_price[:split_px], y_price[:split_px])
+        y_pred_price = eval_price.predict(X_price[split_px:])
+        y_true_price = y_price[split_px:]
+        horizons = ["t+1", "t+3", "t+5", "t+30"]
+        for i, h in enumerate(horizons):
+            r2_price = r2_score(y_true_price[:, i], y_pred_price[:, i])
+            mae_price = mean_absolute_error(y_true_price[:, i], y_pred_price[:, i])
+            persist_mae = mean_absolute_error(
+                y_true_price[:, i], np.zeros_like(y_true_price[:, i])
+            )
+            log.info(
+                "Price %s eval — R²=%.4f, MAE=%.6f | Persistence MAE=%.6f",
+                h, r2_price, mae_price, persist_mae,
+            )
+            try:
+                conn.rollback()
+                cur.execute(
+                    "INSERT INTO training_metrics (model_type, r2, mae) VALUES (%s, %s, %s)",
+                    (f"price_{h}", float(round(r2_price, 6)), float(round(mae_price, 8))),
+                )
+                conn.commit()
+            except Exception as e:
+                log.warning("Failed to save price %s metrics: %s", h, e)
+
+    price_model = RidgeCV(alphas=[1e-4, 5e-4, 1e-3, 5e-3, 0.01, 0.1, 1, 10])
     price_model.fit(X_price, y_price)
     PRICE_MODEL_PATH = MODEL_PATH.replace(".pkl", "_price.pkl")
     joblib.dump(price_model, PRICE_MODEL_PATH)
-    log.info("Price model trained on %d rows, 4 targets (t+1, t+3, t+5, t+30)", len(common_idx))
+    log.info("Price model trained on %d rows, 4 targets (t+1, t+3, t+5, t+30), best_alpha=%.6f", len(common_idx), price_model.alpha_)
 else:
     price_model = None
     log.warning("Not enough price data (%d rows), skipping price model", len(common_idx))
