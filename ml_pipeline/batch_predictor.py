@@ -143,6 +143,34 @@ def build_lag_features(feat_df):
     return feat_df.dropna()
 
 
+ALL_PREFIXES = ["dxy", "eur", "jpy", "gbp", "vix", "sp500"]
+
+
+def override_stale_bars(dfs, r):
+    now = datetime.now(timezone.utc)
+    now_minute = now.replace(second=0, microsecond=0)
+    for prefix in ["dxy", "eur", "jpy", "gbp"]:
+        tdf = dfs[prefix]
+        last_ts = tdf.index[-1]
+        age = (now_minute - last_ts).total_seconds()
+        if age > 90:
+            stream_close = r.get(f"latest:{prefix}:close")
+            if stream_close:
+                stream_close_f = float(stream_close)
+                stream_high = r.get(f"latest:{prefix}:high")
+                stream_low = r.get(f"latest:{prefix}:low")
+                high = float(stream_high) if stream_high else stream_close_f
+                low = float(stream_low) if stream_low else stream_close_f
+                open_val = float(tdf.iloc[-1]["close"])
+                new_row = pd.DataFrame({
+                    "open": [open_val], "high": [high],
+                    "low": [low], "close": [stream_close_f],
+                }, index=[now_minute])
+                dfs[prefix] = pd.concat([tdf, new_row])
+                dfs[prefix] = dfs[prefix][~dfs[prefix].index.duplicated(keep="last")]
+                log.info("Override %s stale bar (%ds old) with stream close=%.4f", prefix, int(age), stream_close_f)
+
+
 def run_one_cycle(producer, conn, cur, r):
     dfs = load_data(cur)
     if dfs is None:
@@ -158,6 +186,8 @@ def run_one_cycle(producer, conn, cur, r):
     feat_df = add_time_features(feat_df)
     if len(feat_df) < 1:
         return
+
+    override_stale_bars(dfs, r)
 
     if not os.path.exists(MODEL_PATH):
         log.warning("Model not found at %s", MODEL_PATH)

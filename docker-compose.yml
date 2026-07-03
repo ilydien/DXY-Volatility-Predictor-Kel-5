@@ -121,7 +121,6 @@ services:
     build: .
     command: >
       sh -c "
-        pip install dbt-postgres -q --no-cache-dir &&
         prefect work-pool create --type process default 2>/dev/null;
         prefect worker start --pool default --type process
       "
@@ -149,7 +148,6 @@ services:
     build: .
     command: >
       sh -c "
-        pip install dbt-postgres -q --no-cache-dir &&
         python -u /app/ml_pipeline/training_flow.py
       "
     volumes:
